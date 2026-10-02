@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FileText, Quote, Sparkles } from "lucide-react";
+import { Clock, Copy, FileText, Quote, Sparkles } from "lucide-react";
 import { useTranslations } from "next-intl";
 
 import {
@@ -16,6 +16,10 @@ import { useAddonStatus } from "@/components/AddonSlotsProvider";
 import type { MediaController } from "@/lib/mediaController";
 import { getMediaClockSnapshot, subscribeMediaClock } from "@/lib/mediaClock";
 import { addSourceCapture } from "@/lib/sourceCapture";
+import { copyText } from "@/lib/copyText";
+import { ActionMenuItem } from "@/components/ActionMenuItem";
+import { ToolbarMenu } from "@/components/ToolbarMenu";
+import { useToast } from "@/components/ToastProvider";
 import {
   recallTranscriptScroll,
   type TranscriptPlace,
@@ -201,6 +205,7 @@ export default function TranscriptSection({
   onAvailability,
 }: TranscriptSectionProps) {
   const t = useTranslations("searchIndex");
+  const toast = useToast();
   const addonStatus = useAddonStatus("intelligence");
   const refineFeature = addonStatus.features?.transcript_refine;
   // Backend sends either boolean false or the string "false" when the
@@ -656,6 +661,26 @@ export default function TranscriptSection({
     [drive, fileId, fileType, filename],
   );
 
+  const copyTranscript = useCallback(
+    async (withTimestamps: boolean) => {
+      const text = cues
+        .filter((cue) => cue.text.trim())
+        .map((cue) => {
+          const line = cue.text.trim();
+          return withTimestamps
+            ? `[${formatDuration(cue.start)}] ${line}`
+            : line;
+        })
+        .join("\n");
+      if (await copyText(text)) {
+        toast.success(t("transcriptCopied"));
+      } else {
+        toast.error(t("transcriptCopyFailed"));
+      }
+    },
+    [cues, t, toast],
+  );
+
   const handleRefine = useCallback(async () => {
     if (refining) return;
     setRefining(true);
@@ -695,7 +720,7 @@ export default function TranscriptSection({
           the reader pressed says "Transcript", and saying it again
           under the button costs a line of a panel whose whole value is
           length. */}
-      <div className="mb-2 flex items-center gap-2 text-sm text-text-muted empty:hidden">
+      <div className="mb-2 flex flex-wrap items-center gap-2 text-sm text-text-muted empty:hidden">
         {!labelledByHost && (
           <>
             <FileText size={14} />
@@ -719,8 +744,35 @@ export default function TranscriptSection({
             ))}
           </div>
         )}
-        {refineEnabled && source === "chunks" && (
-          <div className="ml-auto flex gap-1 text-xs">
+        <div className="ml-auto flex items-center gap-1 text-xs">
+          <ToolbarMenu
+            label={t("transcriptCopy")}
+            value={t("transcriptCopy")}
+            icon={Copy}
+            portalOnPhone
+          >
+            {(close) => (
+              <>
+                <ActionMenuItem
+                  icon={FileText}
+                  label={t("transcriptCopyPlain")}
+                  onClick={() => {
+                    close();
+                    void copyTranscript(false);
+                  }}
+                />
+                <ActionMenuItem
+                  icon={Clock}
+                  label={t("transcriptCopyTimestamped")}
+                  onClick={() => {
+                    close();
+                    void copyTranscript(true);
+                  }}
+                />
+              </>
+            )}
+          </ToolbarMenu>
+          {refineEnabled && source === "chunks" && (
             <button
               type="button"
               onClick={handleRefine}
@@ -730,8 +782,8 @@ export default function TranscriptSection({
               <Sparkles size={11} className={refining ? "animate-pulse" : ""} />
               {t("transcriptRefine")}
             </button>
-          </div>
-        )}
+          )}
+        </div>
       </div>
       <div
         className={`relative ${fillHeight ? "flex min-h-0 flex-1 flex-col" : ""}`}

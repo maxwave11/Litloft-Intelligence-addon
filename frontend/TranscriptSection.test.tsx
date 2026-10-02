@@ -67,6 +67,18 @@ const TRANSCRIPT_RESPONSE = vi.hoisted(() => ({
 const fetchMock = vi.fn().mockResolvedValue(FETCH_MISS);
 vi.stubGlobal("fetch", fetchMock);
 
+const copyTextMock = vi.hoisted(() =>
+  vi.fn<(text: string) => Promise<boolean>>(),
+);
+vi.mock("@/lib/copyText", () => ({ copyText: copyTextMock }));
+
+const toast = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+  info: vi.fn(),
+}));
+vi.mock("@/components/ToastProvider", () => ({ useToast: () => toast }));
+
 // Mock the addon API module to return controlled transcript data.
 // The module exports `getFileTranscript` which the component calls on
 // mount. The test data includes refined + unrefined chunks.
@@ -131,6 +143,11 @@ beforeEach(async () => {
   getFileTranscript.mockResolvedValue(TRANSCRIPT_RESPONSE);
   fetchMock.mockReset();
   fetchMock.mockResolvedValue(FETCH_MISS);
+  copyTextMock.mockReset();
+  copyTextMock.mockResolvedValue(true);
+  toast.success.mockReset();
+  toast.error.mockReset();
+  toast.info.mockReset();
 });
 
 
@@ -241,6 +258,46 @@ describe("TranscriptSection — transcript refine UI", () => {
     expect(
       screen.queryByRole("button", { name: /Undo AI refine/ })
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("TranscriptSection — copying the full transcript", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("copies only the text when timestamps are not requested", async () => {
+    renderSection();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Copy transcript" }),
+    );
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Without timestamps" }),
+    );
+
+    await waitFor(() =>
+      expect(copyTextMock).toHaveBeenCalledWith(
+        "これは修正された文章です。\n未修正の文章。",
+      ),
+    );
+  });
+
+  it("prefixes every line when timestamps are requested", async () => {
+    renderSection();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Copy transcript" }),
+    );
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "With timestamps" }),
+    );
+
+    await waitFor(() =>
+      expect(copyTextMock).toHaveBeenCalledWith(
+        "[0:00] これは修正された文章です。\n[0:05] 未修正の文章。",
+      ),
+    );
   });
 });
 
