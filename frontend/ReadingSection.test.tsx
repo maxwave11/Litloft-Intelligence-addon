@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { MessagesSquare } from "lucide-react";
+import { useState } from "react";
 
 const {
   getFileTranscript,
@@ -328,6 +329,22 @@ describe("tabs other addons offer", () => {
 
     expect(panel.closest("[role=tabpanel]")?.hasAttribute("hidden")).toBe(true);
     expect(document.contains(panel)).toBe(true);
+  });
+
+  it("keeps what is typed in an offered panel when the tabs are switched back and forth", async () => {
+    function Draft() {
+      const [value, setValue] = useState("");
+      return <input aria-label="Draft" value={value} onChange={(e) => setValue(e.target.value)} />;
+    }
+    mountWith(comments({ panel: <Draft /> }));
+    await screen.findByText("Welcome to the talk.");
+
+    fireEvent.click(screen.getByRole("tab", { name: "Comments" }));
+    fireEvent.change(screen.getByLabelText("Draft"), { target: { value: "typed" } });
+    fireEvent.click(screen.getByRole("tab", { name: "Transcript by chapter" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Comments" }));
+
+    expect((screen.getByLabelText("Draft") as HTMLInputElement).value).toBe("typed");
   });
 
   it("is never the tab the page opens on", async () => {
