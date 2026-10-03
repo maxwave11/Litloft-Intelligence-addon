@@ -132,6 +132,10 @@
   },
   "searchIndex": {
     "transcriptTitle": "Transcript",
+    "readableTranscriptTitle": "Transcript by chapter",
+    "readableTranscriptCopy": "Copy",
+    "readableTranscriptCopied": "Transcript copied",
+    "readableTranscriptCopyFailed": "Could not copy the transcript",
     "transcriptResumeFollowing": "Back to current position",
     "transcriptSourceChunks": "Text chunks",
     "transcriptSourceWords": "Words",

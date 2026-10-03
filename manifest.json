@@ -77,6 +77,13 @@
         "priority": 10
       }
     ],
+    "file-detail-reading": [
+      {
+        "id": "readable-transcript",
+        "label": "Transcript by chapter",
+        "priority": 10
+      }
+    ],
     "drive-home-sections": [
       {
         "id": "pickup",

@@ -132,6 +132,10 @@
   },
   "searchIndex": {
     "transcriptTitle": "文字起こし",
+    "readableTranscriptTitle": "章ごとの文字起こし",
+    "readableTranscriptCopy": "コピー",
+    "readableTranscriptCopied": "文字起こしをコピーしました",
+    "readableTranscriptCopyFailed": "文字起こしをコピーできませんでした",
     "transcriptResumeFollowing": "再生位置に戻る",
     "transcriptSourceChunks": "分割テキスト",
     "transcriptSourceWords": "単語",
