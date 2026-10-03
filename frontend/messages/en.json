@@ -309,7 +309,14 @@
     "tagsBatchError": "Could not queue — please retry.",
     "summariesBatchError": "Could not queue — please retry.",
     "tagsFolderConfirm": "Create AI tag candidates for {count} files? LLM usage fees may apply.",
-    "summariesFolderConfirm": "Create AI summaries for {count} files? LLM usage fees may apply."
+    "summariesFolderConfirm": "Create AI summaries for {count} files? LLM usage fees may apply.",
+    "aiFailureUnreachable": "The AI service is not responding. Check that the intelligence container is running.",
+    "aiFailureFeatureOff": "This feature is turned off. Set \"{config}\" to \"manual\" in Admin → Settings (or in search-config.yml), then restart intelligence.",
+    "aiFailureLlmOff": "No language model is connected, so this cannot be created. Choose a provider (Ollama or an OpenAI-compatible API) and a model under Admin → Settings → LLM.",
+    "aiFailureVisionModel": "No vision model is set. Choose an image-capable model in the LLM settings (\"vision_model\").",
+    "aiFailureGeneric": "Could not start the request. Check the intelligence logs for details.",
+    "tagsStillRunning": "Tag candidates are still being created. They will appear here when ready.",
+    "tagsNoCandidates": "No tag candidates were found for this file."
   },
   "detailedSummary": {
     "citations": {

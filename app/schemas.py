@@ -73,6 +73,8 @@ class FeaturesStatus(BaseModel):
     search: bool
     auto_tags: str
     summaries: str
+    detailed_summaries: str = "false"
+    vision_describe: str = "false"
     rag: bool = False
     transcript_refine: str = "false"
     chapter_suggestions: str = "false"
@@ -98,6 +100,7 @@ class ChapterSuggestionsResponse(BaseModel):
 class LLMStatus(BaseModel):
     provider: str
     model: str
+    vision_model: str = ""
     enabled: bool
     output_language: str
 

@@ -309,7 +309,14 @@
     "tagsBatchError": "キューに追加できませんでした。再試行してください。",
     "summariesBatchError": "キューに追加できませんでした。再試行してください。",
     "tagsFolderConfirm": "{count} 件のファイルにAIタグ候補を作成しますか？LLMの利用料が発生する場合があります。",
-    "summariesFolderConfirm": "{count} 件のファイルにAI要約を作成しますか？LLMの利用料が発生する場合があります。"
+    "summariesFolderConfirm": "{count} 件のファイルにAI要約を作成しますか？LLMの利用料が発生する場合があります。",
+    "aiFailureUnreachable": "AIサービスが応答しません。intelligenceコンテナが起動しているか確認してください。",
+    "aiFailureFeatureOff": "この機能は無効です。管理 → 設定（またはsearch-config.yml）で「{config}」を「manual」にして、intelligenceを再起動してください。",
+    "aiFailureLlmOff": "言語モデルが接続されていないため作成できません。管理 → 設定 → LLMでプロバイダー（OllamaまたはOpenAI互換API）とモデルを選択してください。",
+    "aiFailureVisionModel": "ビジョンモデルが未設定です。LLM設定の「vision_model」に画像対応モデルを指定してください。",
+    "aiFailureGeneric": "リクエストを開始できませんでした。詳細はintelligenceのログを確認してください。",
+    "tagsStillRunning": "タグ候補を作成中です。完了するとここに表示されます。",
+    "tagsNoCandidates": "このファイルのタグ候補は見つかりませんでした。"
   },
   "detailedSummary": {
     "citations": {

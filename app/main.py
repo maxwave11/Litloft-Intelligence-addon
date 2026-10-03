@@ -441,6 +441,7 @@ def _llm_status() -> LLMStatus:
     return LLMStatus(
         provider=profile.config.provider if profile else "disabled",
         model=profile.config.model if profile else "",
+        vision_model=(profile.config.vision_model if profile else "") or "",
         enabled=enabled,
         output_language=settings.llm.output_language,
     )
@@ -558,6 +559,8 @@ def status_endpoint() -> StatusResponse:
             search=settings.features.search,
             auto_tags=settings.features.auto_tags,
             summaries=settings.features.summaries,
+            detailed_summaries=settings.features.detailed_summaries,
+            vision_describe=settings.features.vision_describe,
             rag=settings.features.rag,
             transcript_refine=settings.features.transcript_refine,
             chapter_suggestions=settings.features.chapter_suggestions,

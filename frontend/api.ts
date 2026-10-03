@@ -1224,16 +1224,23 @@ export interface AskOptions {
 // projection — we keep both to avoid breaking existing callers.
 export interface IntelligenceStatus {
   status?: string;
+  queue?: {
+    tasks?: Record<string, { waiting: number; processing: string[] }>;
+  };
   features?: {
     indexing: boolean;
     search: boolean;
     auto_tags: string;
     summaries: string;
+    detailed_summaries?: string;
+    vision_describe?: string;
+    chapter_suggestions?: string;
     rag: boolean;
   };
   llm?: {
     provider: string;
     model: string;
+    vision_model?: string;
     enabled: boolean;
     output_language: string;
   };

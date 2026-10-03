@@ -64,6 +64,8 @@ import {
   revertDetailedSummary,
 } from "./api";
 import { useOfferIntelligenceAction } from "./offerIntelligenceAction";
+import { explainAiFailure } from "./aiFailure";
+import { useToast } from "@/components/ToastProvider";
 import type {
   CitationChunkExcerpt,
   DetailedSummaryCitation,
@@ -111,6 +113,7 @@ export default function DetailedSummarySection({
 }: DetailedSummarySectionProps) {
   const t = useTranslations("file");
   const td = useTranslations("detailedSummary");
+  const toast = useToast();
 
   const [data, setData] = useState<DetailedSummaryResponse | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -266,12 +269,14 @@ export default function DetailedSummarySection({
       if (isProfileUnavailable(err)) {
         setProfileRejected(true);
         refetchChoices();
+      } else {
+        toast.error(await explainAiFailure("detailedSummary", drive, t));
       }
       await fetchData();
     } finally {
       setWorking(false);
     }
-  }, [fileId, drive, pollUntilDone, fetchData, refetchChoices]);
+  }, [fileId, drive, pollUntilDone, fetchData, refetchChoices, t, toast]);
 
   const startGenerate = useCallback((profile: string | undefined) => {
     // Entering regenerate from the edited state surfaces a confirm

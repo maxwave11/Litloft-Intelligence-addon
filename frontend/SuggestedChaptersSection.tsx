@@ -26,6 +26,7 @@ import {
 } from "./api";
 import type { SuggestedChaptersResponse } from "./api";
 import { useOfferIntelligenceAction } from "./offerIntelligenceAction";
+import { explainAiFailure } from "./aiFailure";
 import { GeneratingRow } from "./GeneratingRow";
 
 interface SuggestedChaptersSectionProps {
@@ -126,9 +127,8 @@ export default function SuggestedChaptersSection({
     try {
       await generateSuggestedChapters(fileId, drive);
     } catch {
-      if (mountedRef.current) setError(t("chapterCandidatesActionError", {
-        defaultMessage: "The chapter action failed. Try again.",
-      }));
+      const message = await explainAiFailure("chapters", drive, t);
+      if (mountedRef.current) setError(message);
       if (mountedRef.current) setOperation(null);
     }
   }, [drive, fileId, t]);

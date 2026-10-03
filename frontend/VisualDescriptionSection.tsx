@@ -22,6 +22,7 @@ import type {
   VisualDescriptionStatus,
 } from "./api";
 import { useOfferIntelligenceAction } from "./offerIntelligenceAction";
+import { explainAiFailure } from "./aiFailure";
 import { GeneratingRow } from "./GeneratingRow";
 
 interface VisualDescriptionSectionProps {
@@ -142,9 +143,7 @@ export default function VisualDescriptionSection({
                 "The request could not be queued. Check the drive's addon "
                 + "policy and the intelligence logs.",
             })
-          : t("visionActionError", {
-              defaultMessage: "Could not start description generation.",
-            }),
+          : await explainAiFailure("visualDescription", drive, t),
       );
     } finally {
       if (requestId === requestIdRef.current) setWorking(false);

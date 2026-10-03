@@ -3,7 +3,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Check, CheckCheck, RefreshCw, Sparkles, X } from "lucide-react";
-import { getSuggestedTags, dismissSuggestedTags, regenerateSuggestedTags } from "./api";
+import {
+  getIntelligenceStatus,
+  getSuggestedTags,
+  dismissSuggestedTags,
+  regenerateSuggestedTags,
+} from "./api";
+import { explainAiFailure } from "./aiFailure";
+import { useToast } from "@/components/ToastProvider";
 import type { SuggestedTagsResponse } from "./api";
 import { fetchJSON } from "@/lib/api";
 import { ConflictError, saveFileTags } from "@/lib/tags";
@@ -49,8 +56,13 @@ async function getFileData(fileId: string): Promise<FileItem> {
   return fetchJSON<FileItem>(`/api/files/${fileId}`);
 }
 
+// Local candidate scoring rebuilds the corpus IDF and can take over a minute.
+const POLL_INTERVAL_MS = 2000;
+const POLL_MAX_ATTEMPTS = 90;
+
 export default function SuggestedTagsSection({ fileId, drive }: SuggestedTagsSectionProps) {
   const t = useTranslations("file");
+  const toast = useToast();
   const [data, setData] = useState<SuggestedTagsResponse | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [accepting, setAccepting] = useState<Set<string>>(new Set());
@@ -132,22 +144,26 @@ export default function SuggestedTagsSection({ fileId, drive }: SuggestedTagsSec
     setHidden(false);
     try {
       await regenerateSuggestedTags(fileId, drive);
-      // Poll for results — LLM processing takes a few seconds
-      const maxAttempts = 15;
-      for (let i = 0; i < maxAttempts; i++) {
-        await new Promise((r) => setTimeout(r, 2000));
+      for (let i = 0; i < POLL_MAX_ATTEMPTS; i++) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
         const result = await getSuggestedTags(fileId, drive);
         if (result.available && result.tags && result.tags.length > 0) {
           setData(result);
-          break;
+          return;
+        }
+        const tasks = (await getIntelligenceStatus(drive))?.queue?.tasks?.auto_tags;
+        if (i > 0 && tasks && tasks.waiting === 0 && tasks.processing.length === 0) {
+          toast.info(t("tagsNoCandidates"));
+          return;
         }
       }
+      toast.info(t("tagsStillRunning"));
     } catch {
-      // silently fail
+      toast.error(await explainAiFailure("tags", drive, t));
     } finally {
       setRegenerating(false);
     }
-  }, [fileId, drive]);
+  }, [fileId, drive, t, toast]);
 
   const hasPendingTags = Boolean(
     data?.available

@@ -21,6 +21,8 @@ import {
 } from "./api";
 import type { SummaryResponse } from "./api";
 import { useOfferIntelligenceAction } from "./offerIntelligenceAction";
+import { explainAiFailure } from "./aiFailure";
+import { useToast } from "@/components/ToastProvider";
 import { GeneratingRow } from "./GeneratingRow";
 import { choiceOffered, useLLMChoices } from "./llmChoice";
 import { RegenerateWithMenu } from "./RegenerateWithMenu";
@@ -53,6 +55,7 @@ function bulletItems(long: string): string[] | null {
 
 export default function SummarySection({ fileId, drive }: SummarySectionProps) {
   const t = useTranslations("file");
+  const toast = useToast();
   const tc = useTranslations("llmChoice");
   const [data, setData] = useState<SummaryResponse | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -112,11 +115,13 @@ export default function SummarySection({ fileId, drive }: SummarySectionProps) {
       if (isProfileUnavailable(err)) {
         setProfileRejected(true);
         refetchChoices();
+      } else {
+        toast.error(await explainAiFailure("summary", drive, t));
       }
     } finally {
       setRegenerating(false);
     }
-  }, [fileId, drive, refetchChoices]);
+  }, [fileId, drive, refetchChoices, t, toast]);
 
   const handleToggleCollapsed = useCallback(() => {
     setCollapsed((prev) => !prev);
