@@ -30,6 +30,7 @@ from app.routers import (
     search,
     similar,
     summaries,
+    user_summary,
     video_visual,
     vision,
     webhooks,
@@ -426,6 +427,7 @@ app.include_router(similar.router)
 app.include_router(files.router)
 app.include_router(pickup.router)
 app.include_router(summaries.router)
+app.include_router(user_summary.router)
 app.include_router(chapter_suggestions.router)
 app.include_router(rag.router)
 app.include_router(llm_choices.router)

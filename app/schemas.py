@@ -366,6 +366,19 @@ class BatchSummariesResponse(BaseModel):
     skipped: int
 
 
+# --- Summary the viewer writes ---
+
+
+class UserSummaryRequest(BaseModel):
+    content: str = Field(..., max_length=200_000)
+
+
+class UserSummaryResponse(BaseModel):
+    available: bool
+    content: str | None = None
+    updated_at: str | None = None
+
+
 # --- Detailed (long-form Markdown) summary ---
 
 

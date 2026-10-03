@@ -79,8 +79,8 @@
     ],
     "file-detail-reading": [
       {
-        "id": "readable-transcript",
-        "label": "Transcript by chapter",
+        "id": "reading",
+        "label": "Transcript and summary",
         "priority": 10
       }
     ],
@@ -562,6 +562,18 @@
         "path": "/files/{file_id}/summary/revert",
         "methods": [
           "POST"
+        ],
+        "pre_check": {
+          "type": "file_access",
+          "param": "file_id"
+        },
+        "response_filter": null
+      },
+      {
+        "path": "/files/{file_id}/user-summary",
+        "methods": [
+          "GET",
+          "PUT"
         ],
         "pre_check": {
           "type": "file_access",

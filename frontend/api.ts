@@ -675,6 +675,40 @@ export async function revertSummary(
   );
 }
 
+// --- Summary the viewer writes ---
+
+export interface UserSummaryResponse {
+  available: boolean;
+  content?: string | null;
+  updated_at?: string | null;
+}
+
+export async function getUserSummary(
+  fileId: string,
+  drive: string,
+): Promise<UserSummaryResponse> {
+  return fetchJSON<UserSummaryResponse>(
+    `${API_BASE}/addons/intelligence/files/${fileId}/user-summary`,
+    { headers: driveHeaders(drive) },
+  );
+}
+
+/** An empty `content` removes the summary. */
+export async function saveUserSummary(
+  fileId: string,
+  drive: string,
+  content: string,
+): Promise<UserSummaryResponse> {
+  return fetchJSON<UserSummaryResponse>(
+    `${API_BASE}/addons/intelligence/files/${fileId}/user-summary`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...driveHeaders(drive) },
+      body: JSON.stringify({ content }),
+    },
+  );
+}
+
 export interface BatchSummariesResponse {
   queued: number;
   skipped: number;
