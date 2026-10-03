@@ -13,6 +13,9 @@
     "priority": 10
   },
   "slots": {
+    "file-card-indicators": [
+      { "id": "card-indicators", "label": "Transcript and summary status", "priority": 10 }
+    ],
     "search-modes": [
       {
         "id": "find-mode",
@@ -228,6 +231,12 @@
     "target_default": "http://intelligence:8100",
     "health_check": "/health",
     "routes": [
+      {
+        "path": "/files/card-metadata",
+        "methods": ["POST"],
+        "pre_check": { "type": "addon_feature", "feature": "index" },
+        "response_filter": null
+      },
       {
         "path": "/pickup",
         "methods": [

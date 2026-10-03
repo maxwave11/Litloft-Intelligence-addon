@@ -2307,3 +2307,36 @@ class TestClassifyDetailedMissingReason:
             transcript="a" * 500,
         )
         assert classify_detailed_missing_reason("abc") == "not_generated"
+@pytest.mark.asyncio
+async def test_direct_summary_remains_pending_until_all_generations_finish(monkeypatch):
+    import asyncio
+    from app.workers import summaries
+
+    gates = [asyncio.Event(), asyncio.Event()]
+    started = [asyncio.Event(), asyncio.Event()]
+    count = 0
+
+    async def generate(*args):
+        nonlocal count
+        index = count
+        count += 1
+        started[index].set()
+        await gates[index].wait()
+
+    monkeypatch.setattr(summaries, '_get_indexed_file', lambda _: {'file_type': 'video'})
+    monkeypatch.setattr(summaries, '_build_context', lambda *_: 'Transcript text')
+    monkeypatch.setattr(summaries, '_generate_short_long', generate)
+    first = asyncio.create_task(summaries.generate_summary('concurrent', None))
+    second = asyncio.create_task(summaries.generate_summary('concurrent', None))
+    try:
+        await asyncio.gather(*(event.wait() for event in started))
+        assert 'concurrent' in summaries.active_summary_generations
+        gates[0].set()
+        await first
+        assert not second.done()
+        assert 'concurrent' in summaries.active_summary_generations
+    finally:
+        for gate in gates:
+            gate.set()
+        await asyncio.gather(first, second)
+    assert 'concurrent' not in summaries.active_summary_generations

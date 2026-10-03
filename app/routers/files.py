@@ -6,7 +6,8 @@ from urllib.parse import unquote
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, Response
-from sqlalchemy import text as sql_text
+from sqlalchemy import bindparam, text as sql_text
+from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.dependencies import get_auto_tags_worker, get_index_manager
@@ -36,6 +37,61 @@ router = APIRouter(tags=["files"])
 
 _EMBEDDING_TYPES = ("metadata", "clip", "whisper", "text_content", "blip_caption")
 _ITEMS_PER_TYPE = 50
+
+
+class CardMetadataRequest(BaseModel):
+    file_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+@router.post("/files/card-metadata")
+async def get_card_metadata(body: CardMetadataRequest, drive: str = Depends(require_drive)) -> dict:
+    from app.database import get_search_db
+    from app.dependencies import get_summaries_worker
+    from app.policy_client import is_feature_enabled
+    from app.workers.summaries import active_summary_generations
+
+    if not await is_feature_enabled(drive, "index", default_on_failure=False):
+        return {}
+    summary_allowed = settings.features.summaries != "false" and await is_feature_enabled(drive, "summaries", default_on_failure=False)
+    detailed_allowed = settings.features.detailed_summaries != "false" and await is_feature_enabled(drive, "detailed_summaries", default_on_failure=False)
+    manager = get_index_manager()
+    worker = get_summaries_worker()
+    processing = manager.get_queue_breakdown()["whisper"]["processing"]
+    statement = sql_text("""
+        SELECT i.file_id,
+          EXISTS(SELECT 1 FROM transcript_chunks t WHERE t.file_id=i.file_id) AS transcript,
+          EXISTS(SELECT 1 FROM transcript_words w WHERE w.file_id=i.file_id) AS words,
+          EXISTS(SELECT 1 FROM file_insights a WHERE a.file_id=i.file_id
+            AND a.kind='user_summary' AND a.status='active'
+            AND trim(a.content) != '') AS manual_summary,
+          EXISTS(SELECT 1 FROM file_insights a WHERE a.file_id=i.file_id
+            AND a.kind='detailed_summary' AND a.status='active'
+            AND trim(a.content) != '') AS detailed_summary,
+          s.short_summary, s.long_summary, s.detailed_status
+        FROM indexed_files i LEFT JOIN file_summaries s ON s.file_id=i.file_id
+        WHERE i.drive=:drive AND i.active=1 AND i.file_id IN :ids
+    """).bindparams(bindparam("ids", expanding=True))
+    with get_search_db() as db:
+        rows = db.execute(statement, {"drive": drive, "ids": body.file_ids}).mappings().all()
+    result = {}
+    for row in rows:
+        fid = row["file_id"]
+        transcript = "working" if fid in processing or manager.is_queued(fid, "whisper") else (
+            "ready" if row["transcript"] or row["words"] else "missing"
+        )
+        summary = "ready" if row["manual_summary"] else "unknown"
+        if summary_allowed or detailed_allowed:
+            pending = worker.is_pending(fid) or (summary_allowed and fid in active_summary_generations) or (
+                detailed_allowed and row["detailed_status"] == "generating"
+            )
+            present = row["manual_summary"] or (detailed_allowed and row["detailed_summary"]) or (
+                summary_allowed and (row["short_summary"] or row["long_summary"])
+            )
+            summary = "working" if pending else "ready" if present else (
+                "error" if detailed_allowed and row["detailed_status"] == "failed" else "missing"
+            )
+        result[fid] = {"transcript": transcript, "summary": summary}
+    return result
 
 
 def _get_indexed_file_or_404(file_id: str, drive: str) -> dict[str, Any]:

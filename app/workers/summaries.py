@@ -1193,12 +1193,16 @@ async def _generate_short_long(
     )
 
 
+active_summary_generations: dict[str, int] = {}
+
+
 async def generate_summary(file_id: str, resolved: Resolved) -> None:
     """Generate the short/long summary of ``file_id`` with ``resolved``.
 
     For a request that already resolved its profile; it never resolves
     again and never goes through the queue.
     """
+    active_summary_generations[file_id] = active_summary_generations.get(file_id, 0) + 1
     try:
         indexed_file = _get_indexed_file(file_id)
         if indexed_file is None:
@@ -1216,6 +1220,12 @@ async def generate_summary(file_id: str, resolved: Resolved) -> None:
         )
     except Exception as e:  # noqa: BLE001
         logger.error("Summaries: generation failed for %s: %s", file_id, e)
+    finally:
+        remaining = active_summary_generations[file_id] - 1
+        if remaining:
+            active_summary_generations[file_id] = remaining
+        else:
+            active_summary_generations.pop(file_id)
 
 
 class SummariesWorker:
@@ -1224,6 +1234,14 @@ class SummariesWorker:
     def __init__(self) -> None:
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._processing: list[str] = []
+        self._pending: dict[str, int] = {}
+
+    def is_pending(self, file_id: str) -> bool:
+        return self._pending.get(file_id, 0) > 0
+
+    async def _put(self, file_id: str) -> None:
+        self._pending[file_id] = self._pending.get(file_id, 0) + 1
+        await self._queue.put(file_id)
 
     def get_status(self) -> dict[str, object]:
         """Snapshot for /status: ``{waiting, processing}``."""
@@ -1243,7 +1261,7 @@ class SummariesWorker:
         """
         from app.policy_client import is_file_feature_enabled
         if await is_file_feature_enabled(file_id, "summaries"):
-            await self._queue.put(file_id)
+            await self._put(file_id)
             return
         # Short/long blocked — still enqueue if detailed is enabled for
         # this drive so the detailed chain in _process_file can run.
@@ -1251,7 +1269,7 @@ class SummariesWorker:
             settings.features.detailed_summaries == "on_index"
             and await is_file_feature_enabled(file_id, "detailed_summaries")
         ):
-            await self._queue.put(file_id)
+            await self._put(file_id)
 
     async def enqueue_unprocessed(self) -> int:
         """Find indexed files needing summary work and enqueue them.
@@ -1325,7 +1343,7 @@ class SummariesWorker:
                 allowed_cache[key] = allowed
             if not allowed:
                 continue
-            await self._queue.put(file_id)
+            await self._put(file_id)
             seen.add(file_id)
             count += 1
         return count
@@ -1339,6 +1357,11 @@ class SummariesWorker:
                 try:
                     await self._process_file(file_id)
                 finally:
+                    remaining = self._pending.get(file_id, 1) - 1
+                    if remaining:
+                        self._pending[file_id] = remaining
+                    else:
+                        self._pending.pop(file_id, None)
                     try:
                         self._processing.remove(file_id)
                     except ValueError:
