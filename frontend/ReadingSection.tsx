@@ -12,10 +12,12 @@ import { PageTabs } from "@/components/PageTabs";
 import { copyText } from "@/lib/copyText";
 import { useToast } from "@/components/ToastProvider";
 import { useDirty } from "@/hooks/useDirty";
+import { useReadingTabHost, useReadingTabs, type ReadingTab } from "@/lib/readingTabs";
 
 const TRANSCRIPT = "transcript";
 const NEW = "new";
 const summaryKey = (summary: UserSummary) => `summary-${summary.id}`;
+const offeredKey = (tab: ReadingTab) => `offered-${tab.id}`;
 
 interface ReadingSectionProps {
   fileId: string;
@@ -48,6 +50,9 @@ export default function ReadingSection({
   const [dirtyKeys, setDirtyKeys] = useState<ReadonlySet<string>>(new Set());
 
   useDirty({ fileId, source: "user-summary", dirty: dirtyKeys.size > 0 });
+
+  const offered = useReadingTabs(fileId);
+  useReadingTabHost(fileId);
 
   const setDirty = useCallback((key: string, dirty: boolean) => {
     setDirtyKeys((prev) => {
@@ -112,6 +117,7 @@ export default function ReadingSection({
       label: summaryLabel(summary, i),
       icon: NotebookText,
     })),
+    ...offered.map((tab) => ({ key: offeredKey(tab), label: tab.label, icon: tab.icon })),
     { key: NEW, label: t("userSummaryNew"), icon: Plus },
   ].map((item) => ({
     ...item,
@@ -177,6 +183,11 @@ export default function ReadingSection({
           }}
         />
       </div>
+      {offered.map((tab) => (
+        <div key={offeredKey(tab)} {...panelProps(offeredKey(tab))}>
+          {tab.panel}
+        </div>
+      ))}
       {hasTranscript && (
         <div {...panelProps(TRANSCRIPT)}>
           <div className="mb-2 flex justify-end">

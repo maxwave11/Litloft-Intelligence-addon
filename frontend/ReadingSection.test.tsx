@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
+import { MessagesSquare } from "lucide-react";
 
 const {
   getFileTranscript,
@@ -31,6 +32,12 @@ vi.mock("@/components/ToastProvider", () => ({ useToast: () => toast }));
 
 import ReadingSection from "@/addons/intelligence/ReadingSection";
 import { dirtyRegistry } from "@/lib/dirtyRegistry";
+import {
+  resetReadingTabs,
+  useHasReadingTabHost,
+  useOfferReadingTab,
+  type ReadingTab,
+} from "@/lib/readingTabs";
 
 const VTT = `WEBVTT
 
@@ -75,7 +82,10 @@ beforeEach(() => {
   respond(VTT);
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  act(() => resetReadingTabs());
+});
 
 const mount = () => render(<ReadingSection fileId="f1" drive="d" title="My talk" />);
 
@@ -254,5 +264,139 @@ describe("the add summary tab", () => {
     mount();
     await screen.findAllByRole("tab");
     expect(document.activeElement).not.toBe(textbox());
+  });
+});
+
+describe("tabs other addons offer", () => {
+  function Offer({ tab }: { tab: ReadingTab | null }) {
+    useOfferReadingTab("f1", tab);
+    return null;
+  }
+
+  const comments = (over: Partial<ReadingTab> = {}): ReadingTab => ({
+    id: "comments",
+    label: "Comments",
+    icon: MessagesSquare,
+    order: 50,
+    panel: <p>Comment panel</p>,
+    ...over,
+  });
+
+  const mountWith = (...tabs: ReadingTab[]) =>
+    render(
+      <>
+        {tabs.map((tab) => (
+          <Offer key={tab.id} tab={tab} />
+        ))}
+        <ReadingSection fileId="f1" drive="d" title="My talk" />
+      </>,
+    );
+
+  it("sits after the summaries and before Add summary", async () => {
+    listUserSummaries.mockResolvedValue([brief]);
+    mountWith(comments());
+    await screen.findAllByRole("tab");
+
+    expect(tabNames()).toEqual(["Transcript by chapter", "Brief", "Comments", "Add summary"]);
+  });
+
+  it("orders several offered tabs by their order", async () => {
+    mountWith(
+      comments({ id: "late", label: "Late", order: 90 }),
+      comments({ id: "early", label: "Early", order: 20 }),
+    );
+    await screen.findAllByRole("tab");
+
+    expect(tabNames()).toEqual(["Transcript by chapter", "Early", "Late", "Add summary"]);
+  });
+
+  it("shows its panel when chosen and hides the others", async () => {
+    mountWith(comments());
+    await screen.findByText("Welcome to the talk.");
+
+    fireEvent.click(screen.getByRole("tab", { name: "Comments" }));
+
+    expect(selectedTab()).toBe("Comments");
+    expect(screen.getByText("Comment panel").closest("[role=tabpanel]")?.hasAttribute("hidden")).toBe(false);
+    expect(screen.getByText("Welcome to the talk.").closest("[role=tabpanel]")?.hasAttribute("hidden")).toBe(true);
+  });
+
+  it("keeps the panel mounted while another tab is open", async () => {
+    mountWith(comments());
+    await screen.findByText("Welcome to the talk.");
+    const panel = screen.getByText("Comment panel");
+
+    expect(panel.closest("[role=tabpanel]")?.hasAttribute("hidden")).toBe(true);
+    expect(document.contains(panel)).toBe(true);
+  });
+
+  it("is never the tab the page opens on", async () => {
+    mountWith(comments());
+    await screen.findAllByRole("tab");
+
+    expect(selectedTab()).toBe("Transcript by chapter");
+  });
+
+  it("opens on the first summary even with a tab offered", async () => {
+    listUserSummaries.mockResolvedValue([brief]);
+    mountWith(comments());
+    await screen.findAllByRole("tab");
+
+    expect(selectedTab()).toBe("Brief");
+  });
+
+  it("drops the tab, and its panel, when the offer is withdrawn", async () => {
+    const view = mountWith(comments());
+    await screen.findAllByRole("tab");
+
+    view.rerender(
+      <>
+        <Offer tab={null} />
+        <ReadingSection fileId="f1" drive="d" title="My talk" />
+      </>,
+    );
+
+    await waitFor(() => expect(tabNames()).toEqual(["Transcript by chapter", "Add summary"]));
+    expect(screen.queryByText("Comment panel")).toBeNull();
+  });
+
+  it("falls back to the opening tab when the open one is withdrawn", async () => {
+    const view = mountWith(comments());
+    await screen.findByText("Welcome to the talk.");
+    fireEvent.click(screen.getByRole("tab", { name: "Comments" }));
+
+    view.rerender(
+      <>
+        <Offer tab={null} />
+        <ReadingSection fileId="f1" drive="d" title="My talk" />
+      </>,
+    );
+
+    await waitFor(() => expect(selectedTab()).toBe("Transcript by chapter"));
+  });
+
+  it("shows an offer made after it first rendered", async () => {
+    const view = render(<ReadingSection fileId="f1" drive="d" title="My talk" />);
+    await screen.findAllByRole("tab");
+
+    view.rerender(
+      <>
+        <Offer tab={comments()} />
+        <ReadingSection fileId="f1" drive="d" title="My talk" />
+      </>,
+    );
+
+    await waitFor(() => expect(tabNames()).toContain("Comments"));
+  });
+
+  it("tells the offerers it draws the file's tabs while it is mounted", () => {
+    const hosted = renderHook(() => useHasReadingTabHost("f1"));
+    expect(hosted.result.current).toBe(false);
+
+    const view = render(<ReadingSection fileId="f1" drive="d" title="My talk" />);
+    expect(hosted.result.current).toBe(true);
+
+    view.unmount();
+    expect(hosted.result.current).toBe(false);
   });
 });
