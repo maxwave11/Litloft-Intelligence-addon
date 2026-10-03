@@ -132,6 +132,7 @@
   },
   "searchIndex": {
     "transcriptTitle": "Transcript",
+    "exportTranscript": "Transcript",
     "readableTranscriptTitle": "Transcript by chapter",
     "readableTranscriptCopy": "Copy",
     "readableTranscriptCopied": "Transcript copied",

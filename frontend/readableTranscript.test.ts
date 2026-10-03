@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildReadableTranscript,
+  readableTranscriptBody,
   readableTranscriptMarkdown,
   type ReadableChapter,
   type ReadableCue,
@@ -108,5 +109,34 @@ describe("readableTranscriptMarkdown", () => {
 
   it("leaves the title out when there is none", () => {
     expect(readableTranscriptMarkdown("", [{ title: null, paragraphs: ["Only."] }])).toBe("Only.");
+  });
+});
+
+describe("readableTranscriptBody", () => {
+  const sections = buildReadableTranscript(
+    spoken(0, 6),
+    [chapter(10, "Middle"), chapter(20, "End")],
+  );
+
+  it("writes the chapters a level below the video's own headings, with no title", () => {
+    const body = readableTranscriptBody(sections);
+
+    expect(body.split("\n").filter((line) => line.startsWith("#"))).toEqual([
+      "#### Middle",
+      "#### End",
+    ]);
+  });
+
+  it("holds the same text as the page's copy, apart from the title and the heading level", () => {
+    expect(readableTranscriptBody(sections)).toBe(
+      readableTranscriptMarkdown("", sections).replace(/^## /gm, "#### "),
+    );
+  });
+
+  it("is plain paragraphs when there are no chapters", () => {
+    const plain = buildReadableTranscript(spoken(0, 3), []);
+
+    expect(readableTranscriptBody(plain)).not.toContain("#");
+    expect(readableTranscriptBody(plain)).toBe(readableTranscriptMarkdown("", plain));
   });
 });

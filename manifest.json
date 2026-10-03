@@ -87,6 +87,13 @@
         "priority": 10
       }
     ],
+    "markdown-export-sections": [
+      {
+        "id": "transcript-export",
+        "label": "Transcript",
+        "priority": 10
+      }
+    ],
     "drive-home-sections": [
       {
         "id": "pickup",

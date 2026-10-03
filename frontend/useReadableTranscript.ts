@@ -12,6 +12,27 @@ import {
 } from "./readableTranscript";
 import { getFileChapters } from "@/lib/api";
 
+/**
+ * The word-level subtitles are cut every few seconds, which is what lets a
+ * chapter boundary land close to where it was spoken; the chunks are the
+ * fallback for a file indexed before words were kept.
+ */
+export async function loadReadableCues(
+  fileId: string,
+  drive: string,
+  signal?: AbortSignal,
+): Promise<{ cues: TranscriptChunkItem[]; language: string | undefined }> {
+  const words = fetch(`/api/addons/intelligence/files/${fileId}/subtitles.vtt`, { signal })
+    .then((r) => (r.ok ? r.text() : ""))
+    .then((text) => (text ? parseVttCues(text) : []))
+    .catch(() => [] as TranscriptChunkItem[]);
+  const [transcript, wordCues] = await Promise.all([getFileTranscript(fileId, drive), words]);
+  return {
+    cues: wordCues.length > 0 ? wordCues : (transcript.chunks ?? []),
+    language: transcript.language || undefined,
+  };
+}
+
 export function useReadableTranscript(
   fileId: string,
   drive: string,
@@ -22,22 +43,15 @@ export function useReadableTranscript(
   const [loaded, setLoaded] = useState(false);
   const [chapters, setChapters] = useState<ReadableChapter[]>([]);
 
-  // The word-level subtitles are cut every few seconds, which is what lets a
-  // chapter boundary land close to where it was spoken; the chunks are the
-  // fallback for a file indexed before words were kept.
   useEffect(() => {
     let cancelled = false;
     setCues([]);
     setLanguage(undefined);
     setLoaded(false);
-    const words = fetch(`/api/addons/intelligence/files/${fileId}/subtitles.vtt`)
-      .then((r) => (r.ok ? r.text() : ""))
-      .then((text) => (text ? parseVttCues(text) : []))
-      .catch(() => [] as TranscriptChunkItem[]);
-    Promise.all([getFileTranscript(fileId, drive), words]).then(([transcript, wordCues]) => {
+    loadReadableCues(fileId, drive).then((read) => {
       if (cancelled) return;
-      setLanguage(transcript.language || undefined);
-      setCues(wordCues.length > 0 ? wordCues : (transcript.chunks ?? []));
+      setLanguage(read.language);
+      setCues(read.cues);
       setLoaded(true);
     });
     return () => {

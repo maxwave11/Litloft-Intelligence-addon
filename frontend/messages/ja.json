@@ -132,6 +132,7 @@
   },
   "searchIndex": {
     "transcriptTitle": "文字起こし",
+    "exportTranscript": "文字起こし",
     "readableTranscriptTitle": "章ごとの文字起こし",
     "readableTranscriptCopy": "コピー",
     "readableTranscriptCopied": "文字起こしをコピーしました",

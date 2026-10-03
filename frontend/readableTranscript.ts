@@ -129,6 +129,15 @@ export function buildReadableTranscript(
     }));
 }
 
+function sectionBlocks(sections: ReadableSection[], headingMark: string): string[] {
+  const blocks: string[] = [];
+  for (const section of sections) {
+    if (section.title) blocks.push(`${headingMark} ${section.title}`);
+    blocks.push(...section.paragraphs);
+  }
+  return blocks;
+}
+
 /** Markdown for pasting into an agent: the video's title, then each chapter. */
 export function readableTranscriptMarkdown(
   title: string,
@@ -136,9 +145,14 @@ export function readableTranscriptMarkdown(
 ): string {
   const blocks: string[] = [];
   if (title.trim()) blocks.push(`# ${title.trim()}`);
-  for (const section of sections) {
-    if (section.title) blocks.push(`## ${section.title}`);
-    blocks.push(...section.paragraphs);
-  }
+  blocks.push(...sectionBlocks(sections, "##"));
   return blocks.join("\n\n");
+}
+
+/**
+ * The chapters alone, a level below where `readableTranscriptMarkdown` puts
+ * them, for a document that already has the video's title and its own headings.
+ */
+export function readableTranscriptBody(sections: ReadableSection[]): string {
+  return sectionBlocks(sections, "####").join("\n\n");
 }
