@@ -570,9 +570,20 @@
         "response_filter": null
       },
       {
-        "path": "/files/{file_id}/user-summary",
+        "path": "/files/{file_id}/user-summaries",
         "methods": [
           "GET",
+          "POST"
+        ],
+        "pre_check": {
+          "type": "file_access",
+          "param": "file_id"
+        },
+        "response_filter": null
+      },
+      {
+        "path": "/files/{file_id}/user-summaries/{summary_id}",
+        "methods": [
           "PUT"
         ],
         "pre_check": {

@@ -1,18 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useId, useState } from "react";
-import { Copy, FileText, NotebookText } from "lucide-react";
+import { Copy, FileText, NotebookText, Plus } from "lucide-react";
 import { useTranslations } from "next-intl";
 
-import { getUserSummary } from "./api";
+import { listUserSummaries, type UserSummary } from "./api";
 import { readableTranscriptMarkdown } from "./readableTranscript";
 import { useReadableTranscript } from "./useReadableTranscript";
 import UserSummaryPanel from "./UserSummaryPanel";
 import { PageTabs } from "@/components/PageTabs";
 import { copyText } from "@/lib/copyText";
 import { useToast } from "@/components/ToastProvider";
+import { useDirty } from "@/hooks/useDirty";
 
-type Tab = "transcript" | "summary";
+const TRANSCRIPT = "transcript";
+const NEW = "new";
+const summaryKey = (summary: UserSummary) => `summary-${summary.id}`;
 
 interface ReadingSectionProps {
   fileId: string;
@@ -38,22 +41,37 @@ export default function ReadingSection({
     drive,
     chaptersVersion,
   );
-  const [summary, setSummary] = useState<string | null>(null);
-  const [summaryLoaded, setSummaryLoaded] = useState(false);
-  const [tab, setTab] = useState<Tab | null>(null);
+  const [summaries, setSummaries] = useState<UserSummary[]>([]);
+  const [summariesLoaded, setSummariesLoaded] = useState(false);
+  const [tab, setTab] = useState<string | null>(null);
+  const [picked, setPicked] = useState(false);
+  const [dirtyKeys, setDirtyKeys] = useState<ReadonlySet<string>>(new Set());
+
+  useDirty({ fileId, source: "user-summary", dirty: dirtyKeys.size > 0 });
+
+  const setDirty = useCallback((key: string, dirty: boolean) => {
+    setDirtyKeys((prev) => {
+      if (prev.has(key) === dirty) return prev;
+      const next = new Set(prev);
+      if (dirty) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
-    setSummary(null);
-    setSummaryLoaded(false);
+    setSummaries([]);
+    setSummariesLoaded(false);
     setTab(null);
-    getUserSummary(fileId, drive)
-      .then((res) => {
-        if (!cancelled) setSummary(res.available ? (res.content ?? null) : null);
+    setPicked(false);
+    listUserSummaries(fileId, drive)
+      .then((list) => {
+        if (!cancelled) setSummaries(list);
       })
       .catch(() => {})
       .finally(() => {
-        if (!cancelled) setSummaryLoaded(true);
+        if (!cancelled) setSummariesLoaded(true);
       });
     return () => {
       cancelled = true;
@@ -61,13 +79,15 @@ export default function ReadingSection({
   }, [fileId, drive]);
 
   const hasTranscript = sections.length > 0;
+  const defaultTab =
+    summaries.length > 0 ? summaryKey(summaries[0]) : hasTranscript ? TRANSCRIPT : NEW;
 
   // Chosen once both answers are in, so the page does not open on one tab
   // and jump to the other when the slower request lands.
   useEffect(() => {
-    if (tab !== null || !transcriptLoaded || !summaryLoaded) return;
-    setTab(summary !== null || !hasTranscript ? "summary" : "transcript");
-  }, [tab, transcriptLoaded, summaryLoaded, summary, hasTranscript]);
+    if (tab !== null || !transcriptLoaded || !summariesLoaded) return;
+    setTab(defaultTab);
+  }, [tab, transcriptLoaded, summariesLoaded, defaultTab]);
 
   const copy = useCallback(async () => {
     const markdown = readableTranscriptMarkdown(title || filename || "", sections);
@@ -80,19 +100,33 @@ export default function ReadingSection({
 
   if (tab === null) return null;
 
-  const current: Tab = hasTranscript ? tab : "summary";
-  const tabId = (key: Tab) => `${idBase}-${key}-tab`;
-  const panelId = (key: Tab) => `${idBase}-${key}-panel`;
+  const summaryLabel = (summary: UserSummary, i: number) =>
+    summary.title ||
+    (summaries.length === 1 ? t("userSummaryTitle") : t("userSummaryNumbered", { n: i + 1 }));
   const items = [
     ...(hasTranscript
-      ? [{ key: "transcript", label: t("readableTranscriptTitle"), icon: FileText }]
+      ? [{ key: TRANSCRIPT, label: t("readableTranscriptTitle"), icon: FileText }]
       : []),
-    { key: "summary", label: t("userSummaryTitle"), icon: NotebookText },
+    ...summaries.map((summary, i) => ({
+      key: summaryKey(summary),
+      label: summaryLabel(summary, i),
+      icon: NotebookText,
+    })),
+    { key: NEW, label: t("userSummaryNew"), icon: Plus },
   ].map((item) => ({
     ...item,
-    id: tabId(item.key as Tab),
-    controls: panelId(item.key as Tab),
+    id: `${idBase}-${item.key}-tab`,
+    controls: `${idBase}-${item.key}-panel`,
   }));
+  const current = items.some((item) => item.key === tab) ? tab : defaultTab;
+
+  const panelProps = (key: string) => ({
+    role: "tabpanel",
+    id: `${idBase}-${key}-panel`,
+    "aria-labelledby": `${idBase}-${key}-tab`,
+    hidden: current !== key,
+    className: "pt-4",
+  });
 
   return (
     <section className="reading-measure" aria-label={t("readingSectionLabel")}>
@@ -100,32 +134,51 @@ export default function ReadingSection({
         label={t("readingSectionLabel")}
         items={items}
         current={current}
-        onSelect={(key) => setTab(key as Tab)}
+        onSelect={(key) => {
+          setPicked(true);
+          setTab(key);
+        }}
       />
-      {/* Both panels stay mounted so a summary being edited keeps its draft
-          while the transcript is read. */}
-      <div
-        role="tabpanel"
-        id={panelId("summary")}
-        aria-labelledby={tabId("summary")}
-        hidden={current !== "summary"}
-        className="pt-4"
-      >
+      {/* Every panel stays mounted so a summary being edited keeps its draft
+          while another tab is open. */}
+      {summaries.map((summary) => {
+        const key = summaryKey(summary);
+        return (
+          <div key={key} {...panelProps(key)}>
+            <UserSummaryPanel
+              fileId={fileId}
+              drive={drive}
+              summary={summary}
+              onDirtyChange={(dirty) => setDirty(key, dirty)}
+              onSaved={(next) => {
+                if (next) {
+                  setSummaries((prev) => prev.map((s) => (s.id === next.id ? next : s)));
+                } else {
+                  setDirty(key, false);
+                  setSummaries((prev) => prev.filter((s) => s.id !== summary.id));
+                  setTab(null);
+                }
+              }}
+            />
+          </div>
+        );
+      })}
+      <div {...panelProps(NEW)}>
         <UserSummaryPanel
           fileId={fileId}
           drive={drive}
-          content={summary}
-          onSaved={setSummary}
+          summary={null}
+          focus={picked && current === NEW}
+          onDirtyChange={(dirty) => setDirty(NEW, dirty)}
+          onSaved={(next) => {
+            if (!next) return;
+            setSummaries((prev) => [...prev, next]);
+            setTab(summaryKey(next));
+          }}
         />
       </div>
       {hasTranscript && (
-        <div
-          role="tabpanel"
-          id={panelId("transcript")}
-          aria-labelledby={tabId("transcript")}
-          hidden={current !== "transcript"}
-          className="pt-4"
-        >
+        <div {...panelProps(TRANSCRIPT)}>
           <div className="mb-2 flex justify-end">
             <button
               type="button"

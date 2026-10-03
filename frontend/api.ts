@@ -675,38 +675,53 @@ export async function revertSummary(
   );
 }
 
-// --- Summary the viewer writes ---
+// --- Summaries the viewer writes ---
 
-export interface UserSummaryResponse {
-  available: boolean;
-  content?: string | null;
-  updated_at?: string | null;
+export interface UserSummary {
+  id: string;
+  title: string | null;
+  content: string;
 }
 
-export async function getUserSummary(
-  fileId: string,
-  drive: string,
-): Promise<UserSummaryResponse> {
-  return fetchJSON<UserSummaryResponse>(
-    `${API_BASE}/addons/intelligence/files/${fileId}/user-summary`,
-    { headers: driveHeaders(drive) },
-  );
+function userSummariesUrl(fileId: string, summaryId?: string): string {
+  const base = `${API_BASE}/addons/intelligence/files/${fileId}/user-summaries`;
+  return summaryId ? `${base}/${summaryId}` : base;
 }
 
-/** An empty `content` removes the summary. */
-export async function saveUserSummary(
+export async function listUserSummaries(
   fileId: string,
   drive: string,
-  content: string,
-): Promise<UserSummaryResponse> {
-  return fetchJSON<UserSummaryResponse>(
-    `${API_BASE}/addons/intelligence/files/${fileId}/user-summary`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json", ...driveHeaders(drive) },
-      body: JSON.stringify({ content }),
-    },
-  );
+): Promise<UserSummary[]> {
+  const res = await fetchJSON<{ summaries: UserSummary[] }>(userSummariesUrl(fileId), {
+    headers: driveHeaders(drive),
+  });
+  return res.summaries;
+}
+
+export async function createUserSummary(
+  fileId: string,
+  drive: string,
+  body: { title: string; content: string },
+): Promise<UserSummary> {
+  return fetchJSON<UserSummary>(userSummariesUrl(fileId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...driveHeaders(drive) },
+    body: JSON.stringify(body),
+  });
+}
+
+/** An empty `content` deletes the summary and resolves to `null`. */
+export async function updateUserSummary(
+  fileId: string,
+  drive: string,
+  summaryId: string,
+  body: { title: string; content: string },
+): Promise<UserSummary | null> {
+  return fetchJSON<UserSummary | null>(userSummariesUrl(fileId, summaryId), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...driveHeaders(drive) },
+    body: JSON.stringify(body),
+  });
 }
 
 export interface BatchSummariesResponse {

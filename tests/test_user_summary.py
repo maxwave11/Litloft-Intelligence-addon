@@ -26,7 +26,11 @@ from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from app.database import Base, _create_file_insights_table  # noqa: E402
-from app.routers.user_summary import get_user_summary, put_user_summary  # noqa: E402
+from app.routers.user_summary import (  # noqa: E402
+    create_user_summary,
+    list_user_summaries,
+    update_user_summary,
+)
 from app.schemas import UserSummaryRequest  # noqa: E402
 
 
@@ -75,55 +79,92 @@ def engine(tmp_path, monkeypatch):
     return engine
 
 
-def _get(drive: str = "drive1"):
-    return asyncio.run(get_user_summary("abc123", drive=drive))
+def _list(drive: str = "drive1") -> list[tuple[str | None, str]]:
+    res = asyncio.run(list_user_summaries("abc123", drive=drive))
+    return [(item.title, item.content) for item in res.summaries]
 
 
-def _put(content: str, drive: str = "drive1"):
+def _create(content: str, title: str | None = None, drive: str = "drive1"):
     return asyncio.run(
-        put_user_summary("abc123", UserSummaryRequest(content=content), drive=drive)
+        create_user_summary(
+            "abc123", UserSummaryRequest(title=title, content=content), drive=drive
+        )
     )
 
 
-def _rows(engine) -> list[tuple[str, str]]:
-    with engine.connect() as conn:
-        return [
-            (r[0], r[1])
-            for r in conn.execute(
-                text(
-                    "SELECT content, status FROM file_insights "
-                    "WHERE kind = 'user_summary' ORDER BY created_at"
-                )
-            )
-        ]
+def _update(summary_id: str, content: str, title: str | None = None, drive: str = "drive1"):
+    return asyncio.run(
+        update_user_summary(
+            "abc123",
+            summary_id,
+            UserSummaryRequest(title=title, content=content),
+            drive=drive,
+        )
+    )
 
 
-def test_a_file_without_a_summary_has_none(engine) -> None:
-    assert _get().available is False
+def test_a_file_without_summaries_lists_none(engine) -> None:
+    assert _list() == []
 
 
-def test_a_saved_summary_is_read_back_and_a_later_save_replaces_it(engine) -> None:
-    _put("# First\n\n- point")
-    saved = _put("# Second\n")
+def test_summaries_are_listed_in_the_order_they_were_added(engine) -> None:
+    _create("# Short\n", title=" Brief ")
+    _create("Long text.", title="Detailed")
+    _create("No title.")
 
-    assert saved.available is True
-    assert saved.content == "# Second"
-    assert _get().content == "# Second"
-    assert _rows(engine) == [("# First\n\n- point", "superseded"), ("# Second", "active")]
+    assert _list() == [("Brief", "# Short"), ("Detailed", "Long text."), (None, "No title.")]
+
+
+def test_an_edit_changes_one_summary_in_place(engine) -> None:
+    first = _create("One", title="A")
+    _create("Two", title="B")
+
+    edited = _update(first.id, "One, edited", title="A2")
+
+    assert (edited.id, edited.title, edited.content) == (first.id, "A2", "One, edited")
+    assert _list() == [("A2", "One, edited"), ("B", "Two")]
 
 
 @pytest.mark.parametrize("blank", ["", "  \n\t"])
-def test_saving_a_blank_text_removes_the_summary(engine, blank: str) -> None:
-    _put("# Summary")
+def test_saving_a_blank_text_deletes_only_that_summary(engine, blank: str) -> None:
+    first = _create("One")
+    _create("Two")
 
-    assert _put(blank).available is False
-    assert _get().available is False
-    assert _rows(engine) == [("# Summary", "superseded")]
+    assert _update(first.id, blank) is None
+    assert _list() == [(None, "Two")]
 
 
-@pytest.mark.parametrize("call", [_get, lambda drive: _put("x", drive=drive)])
+def test_a_blank_summary_is_not_created(engine) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _create("   ")
+    assert exc.value.status_code == 422
+    assert _list() == []
+
+
+def test_a_summary_of_another_file_is_not_found(engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO file_insights (id, file_id, kind, content, status, "
+                "created_by, created_at) VALUES ('other1', 'zzz999', 'user_summary', "
+                "'Theirs', 'active', 'manual', '2026-01-01')"
+            )
+        )
+    with pytest.raises(HTTPException) as exc:
+        _update("other1", "Mine")
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda drive: _list(drive=drive),
+        lambda drive: _create("x", drive=drive),
+        lambda drive: _update("any", "x", drive=drive),
+    ],
+)
 def test_a_file_of_another_drive_is_not_found(engine, call) -> None:
     with pytest.raises(HTTPException) as exc:
         call(drive="drive2")
     assert exc.value.status_code == 404
-    assert _rows(engine) == []
+    assert _list() == []

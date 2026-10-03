@@ -370,13 +370,18 @@ class BatchSummariesResponse(BaseModel):
 
 
 class UserSummaryRequest(BaseModel):
+    title: str | None = Field(None, max_length=100)
     content: str = Field(..., max_length=200_000)
 
 
-class UserSummaryResponse(BaseModel):
-    available: bool
-    content: str | None = None
-    updated_at: str | None = None
+class UserSummary(BaseModel):
+    id: str
+    title: str | None = None
+    content: str
+
+
+class UserSummaryList(BaseModel):
+    summaries: list[UserSummary]
 
 
 # --- Detailed (long-form Markdown) summary ---
