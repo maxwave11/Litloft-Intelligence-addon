@@ -109,6 +109,15 @@ async def search_endpoint(
         ),
     ),
     drive: str = Depends(require_drive),
+    channel: str | None = Query(
+        default=None,
+        description=(
+            "Restrict the search to one YouTube channel, by the name core "
+            "stores in ``loft_metadata.channel`` (the value the MCP "
+            "``list_channels`` tool returns). Omit to search the whole "
+            "drive; an empty value matches nothing."
+        ),
+    ),
 ) -> SearchResponseModel:
     """Execute a semantic search query within the request's drive.
 
@@ -116,12 +125,18 @@ async def search_endpoint(
     Litloft Generic Addon Proxy from ``/drive/{drive}/...``). Results
     are constrained to that drive — cross-drive search is not exposed
     at all to keep drive-as-privacy-boundary intact.
+
+    ``channel`` narrows the search *before* any retrieval channel ranks:
+    the vector tables are partitioned by channel and the keyword
+    channels carry a matching file_id predicate. Filtering the results
+    afterwards would return almost nothing for a channel smaller than
+    the candidate window.
     """
     try:
         result = await run_in_threadpool(
             execute_search,
             query=q, limit=limit, file_type=type, drive=drive, mode=mode,
-            include_scene_clip=include_scene_clip,
+            include_scene_clip=include_scene_clip, channel=channel,
         )
     except Exception as e:
         logger.error("Search failed: %s", e)

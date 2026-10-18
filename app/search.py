@@ -168,6 +168,7 @@ def search(
     file_id_scope: list[str] | None = None,
     required: "tuple[RequiredTerm, ...] | None" = None,
     include_scene_clip: bool = False,
+    channel: str | None = None,
 ) -> SearchResponse:
     """Execute a hybrid search query.
 
@@ -207,10 +208,30 @@ def search(
             toggle. The toggle is meant for cases where the user
             specifically wants to find a moment inside a long video
             rather than a video whose subject matches the query.
+        channel: Optional YouTube channel to search inside. Applied by
+            every retrieval channel *before* its own ``LIMIT``: the
+            vector channels constrain their partition, the FTS channels
+            add a file_id predicate. ``None`` searches the whole drive. A
+            value that is empty after stripping matches nothing — it is
+            never widened into a whole-drive search.
 
     Returns:
         SearchResponse with ranked results.
     """
+    if channel is not None:
+        channel = channel.strip()
+        if not channel:
+            with get_search_db_read() as session:
+                indexed_count = session.query(IndexedFile).filter(
+                    IndexedFile.active.is_(True)
+                ).count()
+            return SearchResponse(
+                results=(),
+                total=0,
+                indexed_files=indexed_count,
+                service_version=settings.service_version,
+            )
+
     search_config = settings.search
     effective_limit = min(
         limit or search_config.default_limit,
@@ -275,20 +296,28 @@ def search(
     # The retrieval_keywords channel is intentionally additive: a fresh
     # DB without Phase 1 data simply returns [] and contributes nothing.
     with ThreadPoolExecutor(max_workers=6) as _pool:
-        _f_text = _pool.submit(_vector_search_text, text_vector, candidates, mode=mode)
+        _f_text = _pool.submit(
+            _vector_search_text, text_vector, candidates,
+            mode=mode, channel=channel,
+        )
         _f_clip = (
             _pool.submit(
                 _vector_search_clip, clip_vector, candidates,
                 mode=mode, include_scene_clip=include_scene_clip,
+                channel=channel,
             )
             if clip_vector is not None and not skip_clip
             else None
         )
-        _f_kw = _pool.submit(_keyword_search, query, candidates)
-        _f_tr = _pool.submit(_keyword_search_transcripts, query, candidates)
-        _f_tc = _pool.submit(_keyword_search_text_content, query, candidates)
+        _f_kw = _pool.submit(_keyword_search, query, candidates, channel=channel)
+        _f_tr = _pool.submit(
+            _keyword_search_transcripts, query, candidates, channel=channel
+        )
+        _f_tc = _pool.submit(
+            _keyword_search_text_content, query, candidates, channel=channel
+        )
         _f_rk = _pool.submit(
-            _keyword_search_retrieval_keywords, query, candidates
+            _keyword_search_retrieval_keywords, query, candidates, channel=channel
         )
 
         text_matches = _f_text.result()
@@ -426,6 +455,7 @@ def _vector_search_text(
     *,
     mode: SearchMode = "precision",
     include_video_visual_scene: bool = False,
+    channel: str | None = None,
 ) -> list[_VectorMatch]:
     """Search the text vector table for similar embeddings.
 
@@ -458,16 +488,25 @@ def _vector_search_text(
     engine = get_search_engine()
     vec_bytes = query_vector.tobytes()
 
+    # ``channel`` is a vec0 partition key, so the KNN scans only that
+    # channel's rows. It cannot be a join filter: sqlite-vec rejects a
+    # MATCH combined with one, and filtering the result afterwards is
+    # what loses small channels in the first place.
+    partition = "channel = :channel AND " if channel is not None else ""
+    params: dict[str, object] = {"vec": vec_bytes, "limit": limit}
+    if channel is not None:
+        params["channel"] = channel
+
     with engine.connect() as conn:
         rows = conn.execute(
             sql_text(
                 "SELECT embedding_id, distance "
                 "FROM vec_text "
-                "WHERE vector MATCH :vec "
+                f"WHERE {partition}vector MATCH :vec "
                 "ORDER BY distance "
                 "LIMIT :limit"
             ),
-            {"vec": vec_bytes, "limit": limit},
+            params,
         ).fetchall()
 
     if not rows:
@@ -568,6 +607,7 @@ def _vector_search_clip(
     *,
     mode: SearchMode = "precision",
     include_scene_clip: bool = False,
+    channel: str | None = None,
 ) -> list[_VectorMatch]:
     """Search the CLIP vector table for similar embeddings.
 
@@ -600,16 +640,21 @@ def _vector_search_clip(
     engine = get_search_engine()
     vec_bytes = query_vector.tobytes()
 
+    partition = "channel = :channel AND " if channel is not None else ""
+    params: dict[str, object] = {"vec": vec_bytes, "limit": limit}
+    if channel is not None:
+        params["channel"] = channel
+
     with engine.connect() as conn:
         rows = conn.execute(
             sql_text(
                 "SELECT embedding_id, distance "
                 "FROM vec_clip "
-                "WHERE vector MATCH :vec "
+                f"WHERE {partition}vector MATCH :vec "
                 "ORDER BY distance "
                 "LIMIT :limit"
             ),
-            {"vec": vec_bytes, "limit": limit},
+            params,
         ).fetchall()
 
     if not rows:
@@ -757,8 +802,29 @@ class _RetrievalKeywordMatch:
     matched_keyword: str
 
 
+def _channel_fts_clause(channel: str | None, column: str) -> str:
+    """Restrict an FTS channel to one YouTube channel's files.
+
+    Applied inside the FTS query rather than to its result: the channel
+    takes its top-N first, so a filter applied afterwards silently drops
+    every file that did not already make the cut.
+
+    Args:
+        channel: Channel name, already stripped; ``None`` means the whole
+            drive and adds nothing.
+        column: The FTS table's ``file_id`` column, qualified when the
+            query aliases the table (``f.file_id``).
+    """
+    if channel is None:
+        return ""
+    return (
+        f" AND {column} IN ("
+        "SELECT file_id FROM indexed_files WHERE channel = :channel)"
+    )
+
+
 def _keyword_search_transcripts(
-    query: str, limit: int
+    query: str, limit: int, *, channel: str | None = None
 ) -> list[_TranscriptKeywordMatch]:
     """Search transcript chunks using FTS5 trigram index.
 
@@ -777,16 +843,20 @@ def _keyword_search_transcripts(
 
     engine = get_search_engine()
 
+    params: dict[str, object] = {"query": fts_query, "limit": limit}
+    if channel is not None:
+        params["channel"] = channel
     with engine.connect() as conn:
         rows = conn.execute(
             sql_text(
                 "SELECT file_id, chunk_index, text, -rank AS relevance "
                 "FROM fts_transcripts "
-                "WHERE fts_transcripts MATCH :query "
+                "WHERE fts_transcripts MATCH :query"
+                f"{_channel_fts_clause(channel, 'file_id')} "
                 "ORDER BY rank "
                 "LIMIT :limit"
             ),
-            {"query": fts_query, "limit": limit},
+            params,
         ).fetchall()
 
     if not rows:
@@ -900,7 +970,9 @@ def _build_fts_query(query: str) -> str:
     return " AND ".join(term_clauses)
 
 
-def _keyword_search(query: str, limit: int) -> list[_KeywordMatch]:
+def _keyword_search(
+    query: str, limit: int, *, channel: str | None = None
+) -> list[_KeywordMatch]:
     """Search indexed files using FTS5 trigram index.
 
     Uses SQLite FTS5 with trigram tokenizer for efficient substring
@@ -919,17 +991,21 @@ def _keyword_search(query: str, limit: int) -> list[_KeywordMatch]:
 
     engine = get_search_engine()
 
+    params: dict[str, object] = {"query": fts_query, "limit": limit}
+    if channel is not None:
+        params["channel"] = channel
     with engine.connect() as conn:
         # FTS5 rank is negative (more negative = more relevant)
         rows = conn.execute(
             sql_text(
                 "SELECT f.file_id, -f.rank AS relevance "
                 "FROM fts_files f "
-                "WHERE fts_files MATCH :query "
+                "WHERE fts_files MATCH :query"
+                f"{_channel_fts_clause(channel, 'f.file_id')} "
                 "ORDER BY f.rank "
                 "LIMIT :limit"
             ),
-            {"query": fts_query, "limit": limit},
+            params,
         ).fetchall()
 
     if not rows:
@@ -964,7 +1040,7 @@ def _keyword_search(query: str, limit: int) -> list[_KeywordMatch]:
 
 
 def _keyword_search_retrieval_keywords(
-    query: str, limit: int
+    query: str, limit: int, *, channel: str | None = None
 ) -> list[_RetrievalKeywordMatch]:
     """Search SIRA-style LLM-expanded retrieval keywords (fts_retrieval_keywords).
 
@@ -999,15 +1075,19 @@ def _keyword_search_retrieval_keywords(
         # _create_vec_tables has run would 500 here; treat the table
         # missing as "no expansions yet" instead.
         try:
+            params: dict[str, object] = {"query": fts_query, "limit": limit}
+            if channel is not None:
+                params["channel"] = channel
             rows = conn.execute(
                 sql_text(
                     "SELECT file_id, keywords, -rank AS relevance "
                     "FROM fts_retrieval_keywords "
-                    "WHERE fts_retrieval_keywords MATCH :query "
+                    "WHERE fts_retrieval_keywords MATCH :query"
+                    f"{_channel_fts_clause(channel, 'file_id')} "
                     "ORDER BY rank "
                     "LIMIT :limit"
                 ),
-                {"query": fts_query, "limit": limit},
+                params,
             ).fetchall()
         except Exception:
             return []
@@ -1046,7 +1126,7 @@ def _keyword_search_retrieval_keywords(
 
 
 def _keyword_search_text_content(
-    query: str, limit: int
+    query: str, limit: int, *, channel: str | None = None
 ) -> list[_TextContentKeywordMatch]:
     """Search text content chunks using FTS5 trigram index.
 
@@ -1065,16 +1145,20 @@ def _keyword_search_text_content(
 
     engine = get_search_engine()
 
+    params: dict[str, object] = {"query": fts_query, "limit": limit}
+    if channel is not None:
+        params["channel"] = channel
     with engine.connect() as conn:
         rows = conn.execute(
             sql_text(
                 "SELECT file_id, chunk_index, page, text, -rank AS relevance "
                 "FROM fts_text_content "
-                "WHERE fts_text_content MATCH :query "
+                "WHERE fts_text_content MATCH :query"
+                f"{_channel_fts_clause(channel, 'file_id')} "
                 "ORDER BY rank "
                 "LIMIT :limit"
             ),
-            {"query": fts_query, "limit": limit},
+            params,
         ).fetchall()
 
     if not rows:
