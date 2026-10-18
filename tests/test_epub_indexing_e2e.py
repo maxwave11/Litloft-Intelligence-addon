@@ -34,7 +34,7 @@ def search_db(tmp_path, monkeypatch):
         _create_document_sections_table(conn)
         conn.execute(text(
             "CREATE TABLE IF NOT EXISTS vec_text ("
-            "  embedding_id TEXT PRIMARY KEY, vector BLOB NOT NULL)"
+            "  embedding_id TEXT PRIMARY KEY, channel TEXT NOT NULL DEFAULT '', vector BLOB NOT NULL)"
         ))
         conn.execute(text(
             "CREATE VIRTUAL TABLE IF NOT EXISTS fts_text_content "

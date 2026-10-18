@@ -62,7 +62,7 @@ def engine_with_jobs(tmp_path, monkeypatch):
         ))
         conn.execute(text(
             "CREATE TABLE IF NOT EXISTS vec_text ("
-            "  embedding_id TEXT PRIMARY KEY, vector BLOB)"
+            "  embedding_id TEXT PRIMARY KEY, channel TEXT NOT NULL DEFAULT '', vector BLOB)"
         ))
     Session = sessionmaker(bind=eng, expire_on_commit=False)
 

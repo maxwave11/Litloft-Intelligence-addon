@@ -101,7 +101,7 @@ def _build_engine(tmp_path):
         # statements used in tests.
         conn.execute(text(
             "CREATE TABLE IF NOT EXISTS vec_text ("
-            "embedding_id TEXT PRIMARY KEY, vector BLOB)"
+            "embedding_id TEXT PRIMARY KEY, channel TEXT NOT NULL DEFAULT '', vector BLOB)"
         ))
     return engine
 

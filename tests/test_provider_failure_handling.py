@@ -255,7 +255,7 @@ def search_engine(tmp_path):
         ))
         conn.execute(text(
             "CREATE TABLE IF NOT EXISTS vec_text ("
-            "  embedding_id TEXT PRIMARY KEY, vector BLOB)"
+            "  embedding_id TEXT PRIMARY KEY, channel TEXT NOT NULL DEFAULT '', vector BLOB)"
         ))
     return eng
 

@@ -51,7 +51,7 @@ def indexed(monkeypatch, tmp_path):
     with engine.begin() as conn:
         conn.execute(text(
             "CREATE TABLE IF NOT EXISTS vec_text ("
-            "  embedding_id TEXT PRIMARY KEY, vector BLOB)"
+            "  embedding_id TEXT PRIMARY KEY, channel TEXT NOT NULL DEFAULT '', vector BLOB)"
         ))
     maker = sessionmaker(bind=engine, expire_on_commit=False)
 

@@ -66,13 +66,16 @@ def _create_aux_tables(conn: object) -> None:
     """Create the minimum set of aux tables ``index_text_content`` writes to.
 
     We sidestep sqlite-vec by creating a plain ``vec_text`` table whose
-    schema accepts the (embedding_id, vector) tuples production code
-    inserts. The fields aren't queried in these tests; the goal is to
-    let every INSERT/DELETE in the production path complete cleanly.
+    schema accepts the (embedding_id, channel, vector) tuples production
+    code inserts. The fields aren't queried in these tests; the goal is
+    to let every INSERT/DELETE in the production path complete cleanly.
+    ``channel`` is part of the insert since the real table partitions on
+    it (see ``database.insert_vector``).
     """
     conn.execute(text(
         "CREATE TABLE IF NOT EXISTS vec_text ("
         "  embedding_id TEXT PRIMARY KEY,"
+        "  channel TEXT NOT NULL DEFAULT '',"
         "  vector BLOB NOT NULL"
         ")"
     ))
