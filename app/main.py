@@ -20,6 +20,7 @@ from app import llm_routing
 from app.loop_watchdog import LoopWatchdog
 from app.routers import (
     admin,
+    analysis_prompt,
     chapter_suggestions,
     files,
     llm_choices,
@@ -435,6 +436,7 @@ app.include_router(refine.router)
 app.include_router(vision.router)
 app.include_router(video_visual.router)
 app.include_router(admin.router)
+app.include_router(analysis_prompt.router)
 
 
 def _llm_status() -> LLMStatus:

@@ -245,6 +245,11 @@
         "response_filter": null
       },
       {
+        "path": "/analysis-prompt",
+        "methods": ["GET"],
+        "response_filter": null
+      },
+      {
         "path": "/pickup",
         "methods": [
           "GET"
@@ -910,6 +915,15 @@
           "PUT",
           "DELETE"
         ],
+        "drive_optional": true,
+        "pre_check": {
+          "type": "admin"
+        },
+        "response_filter": null
+      },
+      {
+        "path": "/admin/analysis-prompt",
+        "methods": ["GET", "PUT", "DELETE"],
         "drive_optional": true,
         "pre_check": {
           "type": "admin"

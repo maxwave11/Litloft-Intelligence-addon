@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 from app.schemas import FailedJobItem, FailedJobsResponse, ResolveFailedJobResponse
 
 import app.config as config
+from app import analysis_prompt as prompt_store
 from app.transcription_overrides import (
     TranscriptionOverrides,
     delete_overrides,
@@ -404,6 +405,46 @@ async def reset_features_config() -> dict[str, Any]:
         "restart_required": removed,
         "core_notified": notify_status,
     }
+
+
+# ---------------------------------------------------------------------------
+# /admin/analysis-prompt
+# ---------------------------------------------------------------------------
+#
+# Read per request by ``GET /analysis-prompt``, so none of these handlers asks
+# the core to show the restart banner.
+
+
+class AnalysisPromptUpdate(BaseModel):
+    prompt: str
+
+
+@router.get("/analysis-prompt")
+async def get_analysis_prompt_config() -> dict[str, Any]:
+    override = prompt_store.read_override()
+    return {
+        "prompt": override if override is not None else prompt_store.DEFAULT_PROMPT,
+        "default": prompt_store.DEFAULT_PROMPT,
+        "is_default": override is None,
+    }
+
+
+@router.put("/analysis-prompt")
+async def update_analysis_prompt_config(payload: AnalysisPromptUpdate) -> dict[str, Any]:
+    try:
+        prompt_store.validate(payload.prompt)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    path = prompt_store.write_override(
+        payload.prompt, updated_at=datetime.now(UTC).isoformat()
+    )
+    logger.info("Analysis prompt override saved at %s", path)
+    return {"status": "saved"}
+
+
+@router.delete("/analysis-prompt")
+async def reset_analysis_prompt_config() -> dict[str, Any]:
+    return {"status": "reset", "removed": prompt_store.delete_override()}
 
 
 def _validate_features(payload: FeaturesUpdate) -> None:
