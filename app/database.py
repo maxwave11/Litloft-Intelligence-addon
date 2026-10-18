@@ -21,6 +21,11 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from app.config import settings
+from app.vec_partition import (
+    insert_vector_sql as _insert_vector_sql,
+    migrate_if_needed as _vec_channel_migrate,
+    vec_table_ddl,
+)
 
 Base = declarative_base()
 
@@ -145,7 +150,12 @@ def init_search_db() -> None:
     with _search_engine.begin() as conn:
         _migrate_indexed_files_channel_if_needed(conn)
         _backfill_channels_from_litloft(conn)
-        _migrate_vec_channels_if_needed(conn)
+
+    # Deliberately outside the transaction above: pysqlite commits DDL on its
+    # own when it manages the transaction, so a DROP inside one would land
+    # alone and take the table's vectors with it. ``migrate_if_needed`` drives
+    # its own BEGIN IMMEDIATE on a raw connection instead.
+    _migrate_vec_channels_if_needed()
 
     # Migrate indexed_files for thumbnail CLIP support (idempotent).
     with _search_engine.begin() as conn:
@@ -1163,26 +1173,6 @@ def _create_job_records_table(conn: object) -> None:
     ))
 
 
-def _probe_vec_dim(conn: object, table: str) -> int | None:
-    """Return the dimension recorded in ``table``'s CREATE SQL.
-
-    Same ``float[N]`` regex probe as ``_probe_vec_text_dim``, made
-    reusable for both vector tables.
-    """
-    import re
-
-    row = conn.execute(
-        text("SELECT sql FROM sqlite_master WHERE type='table' AND name=:n"),
-        {"n": table},
-    ).fetchone()
-    if row is None:
-        return None
-    match = re.search(r"float\[(\d+)\]", row[0] or "")
-    if match is None:
-        return None
-    return int(match.group(1))
-
-
 def _migrate_indexed_files_channel_if_needed(conn: object) -> None:
     """Add ``indexed_files.channel`` to a search DB created before it.
 
@@ -1249,80 +1239,21 @@ def _backfill_channels_from_litloft(conn: object) -> int:
     return len(updates)
 
 
-def _migrate_vec_channels_if_needed(conn: object) -> None:
-    """Rebuild ``vec_text`` / ``vec_clip`` with a channel partition key.
+def _migrate_vec_channels_if_needed() -> None:
+    """Rebuild an unpartitioned ``vec_text`` / ``vec_clip`` keyed by channel.
 
     sqlite-vec cannot filter a KNN query by a joined column — ``MATCH``
-    refuses one ("A LIMIT or 'k = ?' constraint is required") — so a
-    channel can only narrow the scan if the channel is part of the
-    vector table itself. This is the one-time move from the unpartitioned
-    shape to the partitioned one.
+    refuses one ("A LIMIT or 'k = ?' constraint is required") — so a channel
+    can only narrow the scan if the channel is part of the vector table
+    itself. This is the one-time move from the unpartitioned shape to the
+    partitioned one; ``app.vec_partition`` owns the how.
 
-    Vectors are copied, never recomputed.
+    Runs after ``_backfill_channels_from_litloft`` so the channels it copies
+    are final.
     """
-    import logging
-
-    logger = logging.getLogger(__name__)
-
-    for table in ("vec_text", "vec_clip"):
-        row = conn.execute(
-            text("SELECT sql FROM sqlite_master WHERE type='table' AND name=:n"),
-            {"n": table},
-        ).fetchone()
-        if row is None:
-            continue  # absent — _create_vec_tables builds it partitioned
-        if "PARTITION KEY" in (row[0] or "").upper():
-            continue
-
-        dim = _probe_vec_dim(conn, table)
-        if dim is None:
-            logger.warning(
-                "Cannot read %s's dimension; leaving it unpartitioned", table
-            )
-            continue
-
-        logger.warning(
-            "Rebuilding %s with a channel partition key (one-time migration)",
-            table,
-        )
-        _rebuild_vec_table_with_channel(conn, table, dim)
-
-
-def _rebuild_vec_table_with_channel(
-    conn: object, table: str, dim: int
-) -> None:
-    """Move ``table``'s rows into a partitioned copy of the same name.
-
-    sqlite-vec derives its shadow tables (``<table>_rowids`` and friends)
-    from the name at CREATE time and does not rename them, so
-    ``ALTER TABLE ... RENAME`` leaves the table pointing at shadows that
-    still carry the old name. The copy is therefore built under a
-    temporary name, the original is dropped, and a fresh table is created
-    under the original name — the second copy is what buys a clean set of
-    shadow tables.
-    """
-    staging = f"{table}_channel"
-    create = (
-        f"CREATE VIRTUAL TABLE {{name}} USING vec0("
-        f"embedding_id TEXT PRIMARY KEY, channel TEXT PARTITION KEY, "
-        f"vector float[{dim}])"
-    )
-    conn.execute(text(f"DROP TABLE IF EXISTS {staging}"))
-    conn.execute(text(create.format(name=staging)))
-    conn.execute(text(
-        f"INSERT INTO {staging}(embedding_id, channel, vector) "
-        f"SELECT v.embedding_id, COALESCE(f.channel, ''), v.vector "
-        f"FROM {table} v "
-        "LEFT JOIN embeddings e ON e.id = v.embedding_id "
-        "LEFT JOIN indexed_files f ON f.file_id = e.file_id"
-    ))
-    conn.execute(text(f"DROP TABLE {table}"))
-    conn.execute(text(create.format(name=table)))
-    conn.execute(text(
-        f"INSERT INTO {table}(embedding_id, channel, vector) "
-        f"SELECT embedding_id, channel, vector FROM {staging}"
-    ))
-    conn.execute(text(f"DROP TABLE {staging}"))
+    if _search_engine is None:
+        return
+    _vec_channel_migrate(_search_engine, _resolve_search_db_path())
 
 
 def insert_vector(
@@ -1335,43 +1266,27 @@ def insert_vector(
 ) -> None:
     """Insert one vector row into its file's channel partition.
 
-    The channel is resolved inside the statement rather than passed by
-    the caller: a vec0 partition key is written, never updated, so a row
-    that carries the wrong channel is invisible to a channel-scoped
-    search for good. Resolving it here means no caller can forget it.
-    ``COALESCE`` covers a file whose indexed row has not landed yet —
-    that vector stays searchable outside any channel instead of failing
-    the insert.
+    The channel is resolved by ``insert_vector_sql`` rather than passed by the
+    caller, for the reason given there. The table name is validated because it
+    is interpolated into the statement.
     """
     conn.execute(
-        text(
-            f"INSERT INTO {validate_vector_table(table)}"
-            "(embedding_id, channel, vector) VALUES("
-            ":id, COALESCE((SELECT channel FROM indexed_files "
-            "WHERE file_id = :fid), ''), :vec)"
-        ),
+        text(_insert_vector_sql(validate_vector_table(table))),
         {"id": embedding_id, "fid": file_id, "vec": vector},
     )
 
 
 def _create_vec_tables(conn: object) -> None:
-    """Create sqlite-vec virtual tables if they don't exist."""
-    text_dim = _get_text_embedding_dim()
-    # Text embedding vectors (dimension depends on configured model).
-    # ``channel`` is a partition key so a channel-scoped search scans only
-    # that channel's rows; see ``_migrate_vec_channels_if_needed``.
-    conn.execute(text(
-        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_text "
-        f"USING vec0(embedding_id TEXT PRIMARY KEY, "
-        f"channel TEXT PARTITION KEY, vector float[{text_dim}])"
-    ))
+    """Create sqlite-vec virtual tables if they don't exist.
 
-    # CLIP embedding vectors (dimension depends on configured model)
-    clip_dim = _get_clip_embedding_dim()
+    Both are partitioned by channel so a channel-scoped search scans only that
+    channel's rows; ``app.vec_partition`` owns the DDL.
+    """
     conn.execute(text(
-        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_clip "
-        f"USING vec0(embedding_id TEXT PRIMARY KEY, "
-        f"channel TEXT PARTITION KEY, vector float[{clip_dim}])"
+        vec_table_ddl("vec_text", _get_text_embedding_dim(), if_not_exists=True)
+    ))
+    conn.execute(text(
+        vec_table_ddl("vec_clip", _get_clip_embedding_dim(), if_not_exists=True)
     ))
 
     # Generic index-level metadata key/value store. Created alongside

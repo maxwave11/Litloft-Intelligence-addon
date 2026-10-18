@@ -333,9 +333,10 @@ def test_indexed_files_channel_column_is_added_once(tmp_path):
 @needs_vec
 def test_vec_migration_partitions_an_old_table(tmp_path):
     """An unpartitioned ``vec_text`` is rebuilt in place, vectors intact."""
-    from app.database import _migrate_vec_channels_if_needed
+    from app.vec_partition import migrate_if_needed
 
-    engine = create_engine(f"sqlite:///{tmp_path / 'search.db'}")
+    db_path = tmp_path / "search.db"
+    engine = create_engine(f"sqlite:///{db_path}")
     event.listen(engine, "connect", _load_vec)
     Base.metadata.create_all(engine)
     with engine.begin() as conn:
@@ -363,8 +364,7 @@ def test_vec_migration_partitions_an_old_table(tmp_path):
         ))
         session.commit()
 
-    with engine.begin() as conn:
-        _migrate_vec_channels_if_needed(conn)
+    migrate_if_needed(engine, str(db_path))
 
     with engine.connect() as conn:
         sql = conn.execute(text(
@@ -379,17 +379,25 @@ def test_vec_migration_partitions_an_old_table(tmp_path):
             "WHERE channel = 'ZROBIM' AND vector MATCH :vec "
             "ORDER BY distance LIMIT 5"
         ), {"vec": _vec(1, 0, 0, 0)}).fetchall()
+        names = [
+            row[0] for row in conn.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ))
+        ]
+    engine.dispose()
 
     assert "PARTITION KEY" in sql.upper()
     assert rows == [("e1", "ZROBIM"), ("e2", "Тим Building")]
     assert [r[0] for r in scoped] == ["e1"]
+    assert [n for n in names if n.endswith("_migrate")] == []
 
 
 @needs_vec
 def test_vec_migration_is_idempotent(tmp_path):
-    from app.database import _migrate_vec_channels_if_needed
+    from app.vec_partition import migrate_if_needed
 
-    engine = create_engine(f"sqlite:///{tmp_path / 'search.db'}")
+    db_path = tmp_path / "search.db"
+    engine = create_engine(f"sqlite:///{db_path}")
     event.listen(engine, "connect", _load_vec)
     Base.metadata.create_all(engine)
     with engine.begin() as conn:
@@ -398,15 +406,170 @@ def test_vec_migration_is_idempotent(tmp_path):
             "embedding_id TEXT PRIMARY KEY, "
             "channel TEXT PARTITION KEY, vector float[4])"
         ))
-        _migrate_vec_channels_if_needed(conn)
-        _migrate_vec_channels_if_needed(conn)
+
+    migrate_if_needed(engine, str(db_path))
+    migrate_if_needed(engine, str(db_path))
+
+    with engine.connect() as conn:
         sql = conn.execute(text(
             "SELECT sql FROM sqlite_master "
             "WHERE type='table' AND name='vec_text'"
         )).fetchone()[0]
+    engine.dispose()
 
     assert "PARTITION KEY" in sql.upper()
     assert sql.count("PARTITION KEY") == 1
+
+
+@needs_vec
+def test_migration_probe_reads_the_dimension_of_an_old_table(tmp_path):
+    """The ``float[N]`` read must not be confused by the partition key's
+    ``TEXT``, and a table that already carries the partition is left alone."""
+    from app.vec_partition import _pending_tables
+
+    with _vec_engine(tmp_path) as engine:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE VIRTUAL TABLE vec_clip USING vec0("
+                "embedding_id TEXT PRIMARY KEY, vector float[4])"
+            ))
+        raw = engine.raw_connection()
+        try:
+            pending = _pending_tables(raw.driver_connection)
+        finally:
+            raw.close()
+
+    assert pending == [("vec_clip", DIM)]
+
+
+@needs_vec
+def test_a_failure_after_the_drop_leaves_the_database_exactly_as_it_was(
+    tmp_path, monkeypatch,
+):
+    """A failure mid-rebuild must leave no trace of the attempt.
+
+    Pins the shape the production DB hit. Under the old code the whole
+    rebuild ran in a pysqlite-managed transaction, so DDL committed on its
+    own: a failure at the last statement — a ``DROP`` of the vec0 staging
+    table, which is exactly where production died — threw the run away while
+    the staging table stayed behind, forever. The explicit ``BEGIN IMMEDIATE``
+    in ``migrate_if_needed`` is what makes the rebuild one unit.
+    """
+    from app import vec_partition
+
+    db_path = tmp_path / "search.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    event.listen(engine, "connect", _load_vec)
+    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE VIRTUAL TABLE vec_text USING vec0("
+            "embedding_id TEXT PRIMARY KEY, vector float[4])"
+        ))
+        conn.execute(
+            text("INSERT INTO vec_text(embedding_id, vector) VALUES(:i, :v)"),
+            [
+                {"i": "e1", "v": _vec(1, 0, 0, 0)},
+                {"i": "e2", "v": _vec(0, 1, 0, 0)},
+            ],
+        )
+    with Session(engine) as session:
+        _add_file(session, "f1", "ZROBIM")
+        session.add(Embedding(
+            id="e1", file_id="f1", embedding_type="metadata",
+            vector_table="vec_text", content_preview="a",
+        ))
+        session.commit()
+
+    def before_and_after() -> tuple[str, list[str], list[str]]:
+        with engine.connect() as conn:
+            sql = conn.execute(text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='vec_text'"
+            )).fetchone()[0]
+            ids = [
+                r[0] for r in conn.execute(text(
+                    "SELECT embedding_id FROM vec_text ORDER BY embedding_id"
+                ))
+            ]
+            tables = [r[0] for r in conn.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ))]
+        return sql, ids, tables
+
+    sql_before, ids_before, tables_before = before_and_after()
+
+    # Break the CREATE that follows the DROP.
+    original = vec_partition.vec_table_ddl
+
+    def explode(name: str, dim: int, **kwargs) -> str:
+        if name == "vec_text":
+            raise RuntimeError("simulated failure after the DROP")
+        return original(name, dim, **kwargs)
+
+    monkeypatch.setattr(vec_partition, "vec_table_ddl", explode)
+    with pytest.raises(RuntimeError):
+        vec_partition.migrate_if_needed(engine, str(db_path))
+
+    sql_after, ids_after, tables_after = before_and_after()
+    engine.dispose()
+
+    assert sql_after == sql_before
+    assert ids_after == ids_before
+    # Not "no _migrate table": the whole table set, so a leftover under any
+    # name — the old code's ``vec_text_channel`` included — fails here.
+    assert sorted(tables_after) == sorted(tables_before)
+
+
+@needs_vec
+def test_less_free_disk_than_four_times_the_vectors_refuses_and_writes_nothing(
+    tmp_path, monkeypatch, caplog,
+):
+    """The free-space check runs before BEGIN, so a refusal touches nothing."""
+    import collections
+    import shutil
+
+    from app import vec_partition
+
+    Usage = collections.namedtuple("Usage", "total used free")
+
+    db_path = tmp_path / "search.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    event.listen(engine, "connect", _load_vec)
+    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE VIRTUAL TABLE vec_text USING vec0("
+            "embedding_id TEXT PRIMARY KEY, vector float[4])"
+        ))
+        conn.execute(
+            text("INSERT INTO vec_text(embedding_id, vector) VALUES(:i, :v)"),
+            [{"i": f"e{n}", "v": _vec(1, 0, 0, 0)} for n in range(4)],
+        )
+    with engine.connect() as conn:
+        sql_before = conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_text'"
+        )).fetchone()[0]
+
+    # 4 rows x 4 dims x 4 bytes = 64 bytes of vectors; offer one byte less
+    # than the fourfold the migration asks for.
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: Usage(10**12, 0, 4 * 64 - 1))
+
+    caplog.set_level("INFO")
+    with pytest.raises(RuntimeError, match="Not enough free disk"):
+        vec_partition.migrate_if_needed(engine, str(db_path))
+
+    with engine.connect() as conn:
+        sql_after = conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_text'"
+        )).fetchone()[0]
+        rows = conn.execute(text("SELECT count(*) FROM vec_text")).fetchone()[0]
+    engine.dispose()
+
+    assert any("not enough free disk" in r.getMessage() for r in caplog.records)
+    assert not any("migration: start" in r.getMessage() for r in caplog.records)
+    assert sql_after == sql_before
+    assert rows == 4
 
 
 def test_backfill_takes_channels_from_core_and_strips_them(tmp_path):
@@ -449,14 +612,3 @@ def test_backfill_takes_channels_from_core_and_strips_them(tmp_path):
     assert channels["f1"] == "ZROBIM"
     assert channels["f2"] == "Сергей Зенков Архитектор"
     assert channels["f4"] == ""
-
-
-@needs_vec
-def test_probe_reads_dimension_of_a_partitioned_table(tmp_path):
-    """The model-swap probe keys on ``float[N]``, which the partition
-    key's ``TEXT`` must not confuse."""
-    from app.database import _probe_vec_dim
-
-    with _vec_engine(tmp_path) as engine:
-        with engine.connect() as conn:
-            assert _probe_vec_dim(conn, "vec_text") == DIM

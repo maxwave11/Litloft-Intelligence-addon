@@ -84,7 +84,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
 
     # Initialize databases
-    init_search_db()
+    # Off the loop thread: the first start after an upgrade can spend a long
+    # time migrating the vector tables, which the loop watchdog would report
+    # as a hang — and every request to this addon as a 502 until it finishes.
+    await asyncio.to_thread(init_search_db)
     logger.info("Search database initialized")
 
     try:
@@ -100,12 +103,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Clean up orphaned data from potential crash during previous run
     from app.indexer import (
         cleanup_orphaned_embeddings,
+        repair_unkeyed_vec_rows,
         reset_falsely_completed_clip,
         reset_falsely_completed_clip_thumbnail,
     )
     cleaned = cleanup_orphaned_embeddings()
     if cleaned > 0:
         logger.info("Cleaned up %d orphaned embeddings from previous run", cleaned)
+
+    try:
+        await asyncio.to_thread(repair_unkeyed_vec_rows)
+    except Exception:
+        logger.exception("Failed to repair unkeyed vector rows; continuing startup")
 
     # Reset files marked as clip_indexed but missing actual vectors
     reset = reset_falsely_completed_clip()
