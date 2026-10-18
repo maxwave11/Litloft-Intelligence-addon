@@ -408,6 +408,18 @@ export async function getFileTranscript(
   }
 }
 
+/** The text Copy for AI puts above the transcript. Rejects when it cannot be read. */
+export async function getAnalysisPrompt(drive: string): Promise<string> {
+  const { prompt } = await fetchJSON<{ prompt: unknown }>(
+    `${API_BASE}/addons/intelligence/analysis-prompt`,
+    { headers: driveHeaders(drive) },
+  );
+  if (typeof prompt !== "string" || prompt.trim() === "") {
+    throw new Error("The analysis prompt is empty");
+  }
+  return prompt;
+}
+
 // --- Transcript refine (AI correction of ASR output) ---
 
 export interface RefineFileResponse {

@@ -1,21 +1,29 @@
 "use client";
 
 import { useCallback, useEffect, useId, useState } from "react";
-import { Copy, FileText, NotebookText, Plus } from "lucide-react";
+import { Copy, FileText, NotebookText, Plus, Sparkles } from "lucide-react";
 import { useTranslations } from "next-intl";
 
-import { listUserSummaries, type UserSummary } from "./api";
+import { getAnalysisPrompt, listUserSummaries, type UserSummary } from "./api";
+import { TRANSCRIPT_EXPORT_ID } from "./exportIds";
 import { readableTranscriptMarkdown } from "./readableTranscript";
 import { useReadableTranscript } from "./useReadableTranscript";
 import UserSummaryPanel from "./UserSummaryPanel";
+import { AddonSlot } from "@/components/AddonSlot";
+import { assembleVideoMarkdown } from "@/components/markdownExport/document";
+import { exportFile } from "@/components/markdownExport/runExport";
+import { EXPORT_SECTIONS_SLOT, useExportProviders } from "@/components/markdownExport/useExportProviders";
 import { PageTabs } from "@/components/PageTabs";
 import { copyText } from "@/lib/copyText";
 import { useToast } from "@/components/ToastProvider";
 import { useDirty } from "@/hooks/useDirty";
 import { useReadingTabHost, useReadingTabs, type ReadingTab } from "@/lib/readingTabs";
+import type { FileItem } from "@/types";
 
 const TRANSCRIPT = "transcript";
 const NEW = "new";
+const COPY_BUTTON =
+  "flex items-center gap-1 rounded-lg px-2 py-1 text-xs text-text-muted transition-colors hover:bg-bg-elevated hover:text-text-primary pointer-coarse:min-h-11";
 const summaryKey = (summary: UserSummary) => `summary-${summary.id}`;
 const offeredKey = (tab: ReadingTab) => `offered-${tab.id}`;
 
@@ -24,6 +32,8 @@ interface ReadingSectionProps {
   drive: string;
   filename?: string;
   title?: string;
+  /** The page's own record; without it there is nothing to build a document from. */
+  file?: FileItem;
   /** Changes when the file's chapters are replaced. */
   chaptersVersion?: number;
 }
@@ -33,9 +43,11 @@ export default function ReadingSection({
   drive,
   filename,
   title,
+  file,
   chaptersVersion = 0,
 }: ReadingSectionProps) {
   const t = useTranslations("searchIndex");
+  const tExport = useTranslations("markdownExport");
   const toast = useToast();
   const idBase = useId();
   const { sections, loaded: transcriptLoaded } = useReadableTranscript(
@@ -48,6 +60,8 @@ export default function ReadingSection({
   const [tab, setTab] = useState<string | null>(null);
   const [picked, setPicked] = useState(false);
   const [dirtyKeys, setDirtyKeys] = useState<ReadonlySet<string>>(new Set());
+  const [preparingForAi, setPreparingForAi] = useState(false);
+  const exportProviders = useExportProviders();
 
   useDirty({ fileId, source: "user-summary", dirty: dirtyKeys.size > 0 });
 
@@ -103,6 +117,39 @@ export default function ReadingSection({
     }
   }, [filename, sections, t, title, toast]);
 
+  const copyForAi = useCallback(async () => {
+    if (!file) return;
+    const { providers } = exportProviders;
+    setPreparingForAi(true);
+    try {
+      const [prompt, exported] = await Promise.all([
+        getAnalysisPrompt(drive),
+        exportFile(file, drive, providers, new AbortController().signal),
+      ]);
+      const video = assembleVideoMarkdown(exported, providers, { added: tExport("added") });
+      if (exported.outcomes[TRANSCRIPT_EXPORT_ID]?.kind !== "section" || video === null) {
+        throw new Error("The transcript is not available");
+      }
+      const missing = providers
+        .filter((p) => {
+          const kind = exported.outcomes[p.id]?.kind ?? "failed";
+          return kind === "empty" || kind === "failed";
+        })
+        .map((p) => p.label);
+      if (!(await copyText(`${prompt}\n\n---\n\n${video}`))) {
+        toast.error(t("readableTranscriptCopyForAiFailed"));
+      } else if (missing.length > 0) {
+        toast.success(t("readableTranscriptCopiedForAiMissing", { sections: missing.join(", ") }));
+      } else {
+        toast.success(t("readableTranscriptCopiedForAi"));
+      }
+    } catch {
+      toast.error(t("readableTranscriptPrepareFailed"));
+    } finally {
+      setPreparingForAi(false);
+    }
+  }, [drive, exportProviders, file, t, tExport, toast]);
+
   if (tab === null) return null;
 
   const summaryLabel = (summary: UserSummary, i: number) =>
@@ -136,6 +183,7 @@ export default function ReadingSection({
 
   return (
     <section className="reading-measure" aria-label={t("readingSectionLabel")}>
+      {file && <AddonSlot id={EXPORT_SECTIONS_SLOT} props={{ drive }} />}
       <PageTabs
         label={t("readingSectionLabel")}
         items={items}
@@ -190,15 +238,26 @@ export default function ReadingSection({
       ))}
       {hasTranscript && (
         <div {...panelProps(TRANSCRIPT)}>
-          <div className="mb-2 flex justify-end">
+          <div className="mb-2 flex flex-wrap justify-end gap-1">
             <button
               type="button"
               onClick={() => void copy()}
-              className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs text-text-muted transition-colors hover:bg-bg-elevated hover:text-text-primary pointer-coarse:min-h-11"
+              className={COPY_BUTTON}
             >
               <Copy size={12} />
               {t("readableTranscriptCopy")}
             </button>
+            {file && (
+              <button
+                type="button"
+                onClick={() => void copyForAi()}
+                disabled={!exportProviders.ready || preparingForAi}
+                className={`${COPY_BUTTON} disabled:pointer-events-none disabled:opacity-50`}
+              >
+                <Sparkles size={12} />
+                {t("readableTranscriptCopyForAi")}
+              </button>
+            )}
           </div>
           <div className="text-base leading-relaxed text-text-primary [&>div+div]:mt-[1.4em]">
             {sections.map((section, i) => (

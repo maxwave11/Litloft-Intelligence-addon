@@ -3,6 +3,7 @@
 import { useMemo } from "react";
 import { useTranslations } from "next-intl";
 
+import { TRANSCRIPT_EXPORT_ID } from "./exportIds";
 import { loadReadableCues } from "./useReadableTranscript";
 import { buildReadableTranscript, readableTranscriptBody } from "./readableTranscript";
 import { useOfferExportSection, type ExportSectionProvider } from "@/lib/exportSections";
@@ -14,7 +15,7 @@ export default function TranscriptExportSection() {
 
   const provider = useMemo<ExportSectionProvider>(
     () => ({
-      id: "transcript-export",
+      id: TRANSCRIPT_EXPORT_ID,
       label,
       order: 10,
       build: async (file, drive, signal) => {

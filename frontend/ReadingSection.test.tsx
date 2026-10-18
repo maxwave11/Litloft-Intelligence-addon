@@ -3,12 +3,17 @@ import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@t
 import { MessagesSquare } from "lucide-react";
 import { useState } from "react";
 
+import type { ExportSectionProvider } from "@/lib/exportSections";
+import type { FileItem } from "@/types";
+
 const {
   getFileTranscript,
   listUserSummaries,
   createUserSummary,
   updateUserSummary,
   getFileChapters,
+  getAnalysisPrompt,
+  exportProviders,
   copyText,
   toast,
 } = vi.hoisted(() => ({
@@ -17,6 +22,8 @@ const {
   createUserSummary: vi.fn(),
   updateUserSummary: vi.fn(),
   getFileChapters: vi.fn(),
+  getAnalysisPrompt: vi.fn(),
+  exportProviders: { ready: true, providers: [] as unknown[], unavailable: [] as string[] },
   copyText: vi.fn(),
   toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() },
 }));
@@ -26,7 +33,13 @@ vi.mock("@/addons/intelligence/api", () => ({
   listUserSummaries,
   createUserSummary,
   updateUserSummary,
+  getAnalysisPrompt,
 }));
+vi.mock("@/components/markdownExport/useExportProviders", () => ({
+  EXPORT_SECTIONS_SLOT: "markdown-export-sections",
+  useExportProviders: () => exportProviders,
+}));
+vi.mock("@/components/AddonSlot", () => ({ AddonSlot: () => null }));
 vi.mock("@/lib/api", () => ({ getFileChapters }));
 vi.mock("@/lib/copyText", () => ({ copyText }));
 vi.mock("@/components/ToastProvider", () => ({ useToast: () => toast }));
@@ -77,6 +90,10 @@ beforeEach(() => {
   getFileChapters
     .mockReset()
     .mockResolvedValue({ chapters: [{ start_time: 60, end_time: null, title: "Part two", ordering: 0 }], source: "curated" });
+  getAnalysisPrompt.mockReset().mockResolvedValue("PROMPT");
+  exportProviders.ready = true;
+  exportProviders.providers = [];
+  exportProviders.unavailable = [];
   copyText.mockReset().mockResolvedValue(true);
   toast.success.mockReset();
   toast.error.mockReset();
@@ -415,5 +432,141 @@ describe("tabs other addons offer", () => {
 
     view.unmount();
     expect(hosted.result.current).toBe(false);
+  });
+});
+
+describe("Copy for AI", () => {
+  const file = {
+    id: "f1",
+    title: "My talk",
+    filename: "talk.mp4",
+    file_type: "video",
+    duration: 754,
+    created_at: "2026-05-01T10:00:00Z",
+    tags: [],
+  } as unknown as FileItem;
+
+  type Outcome = ExportSectionProvider["build"];
+  const provider = (id: string, label: string, build: Outcome, preamble?: string) => ({
+    id,
+    label,
+    order: id === "transcript-export" ? 10 : 20,
+    preamble,
+    build: vi.fn(build),
+  });
+  const section = (markdown: string): Outcome => async () => ({ kind: "section", markdown });
+  const answer = (kind: "empty" | "not-applicable"): Outcome => async () => ({ kind });
+  const reject: Outcome = async () => {
+    throw new Error("boom");
+  };
+
+  const transcript = (build: Outcome = section("#### Intro\n\nHello.")) =>
+    provider("transcript-export", "Transcript", build);
+  const comments = (build: Outcome, preamble = "KEY") =>
+    provider("youtube-comments", "YouTube comments", build, preamble);
+
+  const mountFile = () =>
+    render(<ReadingSection fileId="f1" drive="d" title="My talk" file={file} />);
+  const press = async () => {
+    await screen.findByText("Welcome to the talk.");
+    fireEvent.click(screen.getByRole("button", { name: "Copy for AI" }));
+  };
+
+  it("copies the prompt, then the video with its transcript and comments", async () => {
+    exportProviders.providers = [transcript(), comments(section("- [VIEWER] x"))];
+    mountFile();
+    await press();
+
+    await waitFor(() => expect(copyText).toHaveBeenCalledTimes(1));
+    expect(copyText.mock.calls[0][0]).toBe(
+      [
+        "PROMPT",
+        "---",
+        "## My talk",
+        "_12:34 · added 2026-05-01_",
+        "KEY",
+        "### Transcript",
+        "#### Intro\n\nHello.",
+        "### YouTube comments",
+        "- [VIEWER] x",
+      ].join("\n\n"),
+    );
+    expect(getAnalysisPrompt).toHaveBeenCalledWith("d");
+    expect(toast.success).toHaveBeenCalledWith("Copied for AI");
+  });
+
+  it("copies the transcript alone, and says what was missing, when comments are", async () => {
+    exportProviders.providers = [transcript(), comments(answer("empty"))];
+    mountFile();
+    await press();
+
+    await waitFor(() => expect(copyText).toHaveBeenCalledTimes(1));
+    expect(copyText.mock.calls[0][0]).not.toContain("YouTube comments\n");
+    expect(copyText.mock.calls[0][0]).not.toContain("KEY");
+    expect(toast.success).toHaveBeenCalledWith("Copied for AI. Nothing found for: YouTube comments");
+  });
+
+  it("says the same when the comments failed to load", async () => {
+    exportProviders.providers = [transcript(), comments(reject)];
+    mountFile();
+    await press();
+
+    await waitFor(() => expect(copyText).toHaveBeenCalledTimes(1));
+    expect(toast.success).toHaveBeenCalledWith("Copied for AI. Nothing found for: YouTube comments");
+  });
+
+  it("does not mention a section that never applies to the file", async () => {
+    exportProviders.providers = [transcript(), comments(answer("not-applicable"))];
+    mountFile();
+    await press();
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Copied for AI"));
+  });
+
+  it("copies nothing when the prompt cannot be loaded", async () => {
+    getAnalysisPrompt.mockRejectedValue(new Error("down"));
+    exportProviders.providers = [transcript(), comments(section("- c"))];
+    mountFile();
+    await press();
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Could not prepare the text to copy"));
+    expect(copyText).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, Outcome]>([
+    ["has nothing", answer("empty")],
+    ["fails", reject],
+  ])("copies nothing when the transcript %s", async (_name, build) => {
+    exportProviders.providers = [transcript(build), comments(section("- c"))];
+    mountFile();
+    await press();
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Could not prepare the text to copy"));
+    expect(copyText).not.toHaveBeenCalled();
+  });
+
+  it("reports a clipboard that refuses", async () => {
+    copyText.mockResolvedValue(false);
+    exportProviders.providers = [transcript()];
+    mountFile();
+    await press();
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Could not copy"));
+  });
+
+  it("waits until the providers are known", async () => {
+    exportProviders.ready = false;
+    mountFile();
+    await screen.findByText("Welcome to the talk.");
+
+    expect(screen.getByRole("button", { name: "Copy for AI" })).toBeDisabled();
+  });
+
+  it("is not offered without the file's record, and leaves Copy alone", async () => {
+    mount();
+    await screen.findByText("Welcome to the talk.");
+
+    expect(screen.queryByRole("button", { name: "Copy for AI" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Copy" })).toBeEnabled();
   });
 });
