@@ -94,6 +94,15 @@ class IndexedFile(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     tags_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
+    # YouTube channel of an imported video, copied from core
+    # ``loft_metadata.channel``. Empty for anything that is not a remote
+    # link. Stripped on the way in: vec0 compares a partition key by
+    # exact equality and core stores at least one channel with a
+    # trailing space, which would otherwise hide the whole channel.
+    channel: Mapped[str] = mapped_column(
+        String, nullable=False, default="", server_default=""
+    )
+
     indexed_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(UTC)
     )
@@ -107,6 +116,7 @@ class IndexedFile(Base):
         Index("idx_indexed_files_drive", "drive"),
         Index("idx_indexed_files_active", "active"),
         Index("idx_indexed_files_file_type", "file_type"),
+        Index("idx_indexed_files_channel", "channel"),
         Index("idx_indexed_files_metadata_indexed", "metadata_indexed"),
         Index("idx_indexed_files_clip_indexed", "clip_indexed"),
         Index(

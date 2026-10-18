@@ -425,6 +425,7 @@ class IndexManager:
                     or snap["filename"] != core["filename"]
                     or snap.get("file_type") != core.get("file_type")
                     or snap.get("mime_type") != core.get("mime_type")
+                    or snap.get("channel") != core.get("channel")
                 ):
                     drifted.append(file_id)
 
@@ -557,6 +558,7 @@ class IndexManager:
                             title=title,
                             description=description,
                             tags_text=tags_text,
+                            channel=(file_data.get("channel") or "").strip(),
                         )
                         session.add(indexed_file)
 
@@ -1170,6 +1172,8 @@ class IndexManager:
             except Exception:
                 indexing_drives.add(drive)
 
+        repartitioned: list[str] = []
+
         def _apply_moves() -> None:
             with get_search_db() as session:
                 for file_id, meta in litloft_meta.items():
@@ -1216,6 +1220,12 @@ class IndexManager:
                     # way it invalidates ``file_path``.
                     indexed.thumbnail_path = meta.get("thumbnail_path")
 
+                    new_channel = meta.get("channel") or ""
+                    if indexed.channel != new_channel:
+                        _drop_vectors_for_channel_change(session, indexed)
+                        indexed.channel = new_channel
+                        repartitioned.append(file_id)
+
                     # FTS5 has no UNIQUE on file_id, so ``INSERT OR
                     # REPLACE`` would leave the old row alongside the new
                     # one. Delete first to keep the index single-rowed
@@ -1230,6 +1240,13 @@ class IndexManager:
                     )
 
         await asyncio.to_thread(_apply_moves)
+
+        if repartitioned:
+            logger.warning(
+                "channel changed for %d file(s); their vectors were dropped "
+                "and will be rebuilt on the next reconcile: %s",
+                len(repartitioned), ", ".join(sorted(repartitioned)[:5]),
+            )
 
         # A move can hand a file the first usable thumbnail path it has
         # ever had. Reconcile's sync cannot notice — the path it would
@@ -1883,17 +1900,35 @@ def _get_litloft_files_by_ids(file_ids: list[str]) -> dict[str, dict]:
         # ``thumbnail_path`` was added to core's File model long ago, but
         # some test fixtures still create a slimmer ``files`` table. Probe
         # via PRAGMA so the addon stays compatible with both.
-        has_thumbnail_path = any(
-            row[1] == "thumbnail_path"
+        cols = {
+            row[1]
             for row in session.execute(sql_text("PRAGMA table_info(files)")).fetchall()
-        )
+        }
+        has_thumbnail_path = "thumbnail_path" in cols
+        has_loft_metadata = session.execute(
+            sql_text(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='loft_metadata'"
+            )
+        ).fetchone() is not None
 
         thumb_select = "thumbnail_path" if has_thumbnail_path else "NULL AS thumbnail_path"
+        channel_select = (
+            "COALESCE(lm.channel, '') AS channel"
+            if has_loft_metadata
+            else "'' AS channel"
+        )
+        channel_join = (
+            " LEFT JOIN loft_metadata lm ON lm.file_id = files.id"
+            if has_loft_metadata
+            else ""
+        )
         rows = session.execute(
             sql_text(
-                f"SELECT id, drive, file_path, filename, title, {thumb_select}, "
-                "file_type, mime_type "
-                "FROM files WHERE id IN :ids"
+                f"SELECT files.id, files.drive, files.file_path, files.filename, "
+                f"files.title, {thumb_select}, files.file_type, files.mime_type, "
+                f"{channel_select} "
+                f"FROM files{channel_join} WHERE files.id IN :ids"
             ).bindparams(bindparam("ids", expanding=True)),
             {"ids": list(file_ids)},
         ).fetchall()
@@ -1907,6 +1942,7 @@ def _get_litloft_files_by_ids(file_ids: list[str]) -> dict[str, dict]:
                 "thumbnail_path": row[5],
                 "file_type": row[6],
                 "mime_type": row[7],
+                "channel": (row[8] or "").strip(),
             }
             for row in rows
         }
@@ -1933,10 +1969,31 @@ def _get_litloft_files() -> list[dict]:
         thumb_select = (
             "thumbnail_path" if "thumbnail_path" in cols else "NULL AS thumbnail_path"
         )
+        # ``loft_metadata`` only exists once media_import has recorded a
+        # link's source metadata; a DB that never imported one has no
+        # channels to read.
+        has_loft_metadata = session.execute(
+            sql_text(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='loft_metadata'"
+            )
+        ).fetchone() is not None
+        channel_select = (
+            "COALESCE(lm.channel, '') AS channel"
+            if has_loft_metadata
+            else "'' AS channel"
+        )
+        channel_join = (
+            " LEFT JOIN loft_metadata lm ON lm.file_id = files.id"
+            if has_loft_metadata
+            else ""
+        )
         query = (
-            "SELECT id, filename, title, description, drive, folder_path, "
-            "file_path, file_size, file_type, mime_type, duration, deleted_at, "
-            f"{missing_since_select}, {thumb_select} FROM files"
+            "SELECT files.id, files.filename, files.title, files.description, "
+            "files.drive, files.folder_path, files.file_path, files.file_size, "
+            "files.file_type, files.mime_type, files.duration, files.deleted_at, "
+            f"{missing_since_select}, {thumb_select}, {channel_select} "
+            f"FROM files{channel_join}"
         )
 
         rows = session.execute(sql_text(query)).fetchall()
@@ -1957,6 +2014,7 @@ def _get_litloft_files() -> list[dict]:
                 "deleted_at": row[11],
                 "missing_since": row[12],
                 "thumbnail_path": row[13],
+                "channel": (row[14] or "").strip(),
             }
             for row in rows
         ]
@@ -2034,6 +2092,7 @@ def _get_indexed_metadata() -> dict[str, dict]:
             IndexedFile.mime_type,
             IndexedFile.active,
             IndexedFile.thumbnail_path,
+            IndexedFile.channel,
         ).all()
         return {
             row[0]: {
@@ -2044,9 +2103,42 @@ def _get_indexed_metadata() -> dict[str, dict]:
                 "mime_type": row[5],
                 "active": row[6],
                 "thumbnail_path": row[7],
+                "channel": row[8],
             }
             for row in rows
         }
+
+
+def _drop_vectors_for_channel_change(session: object, indexed: IndexedFile) -> None:
+    """Drop a file's vectors when its channel moves.
+
+    A vec0 partition key is written at insert time and cannot be updated,
+    so vectors stored under the old channel would keep answering a search
+    for it — and would be missing from the new one. They are deleted
+    together with their ``embeddings`` rows and every ``*_indexed`` flag
+    is cleared, because the workers that write them are the only code
+    that can rebuild them and they skip a file whose flag says "done".
+
+    Re-embedding is the price of a channel change; a ``.loft``'s channel
+    comes from its source URL and does not move in normal use.
+    """
+    embeddings = session.query(Embedding).filter_by(file_id=indexed.file_id).all()
+    for emb in embeddings:
+        table_raw = emb.vector_table or ""
+        if table_raw in ("vec_text", "vec_clip"):
+            table = validate_vector_table(table_raw)
+            session.execute(
+                sql_text(f"DELETE FROM {table} WHERE embedding_id = :id"),
+                {"id": emb.id},
+            )
+        session.delete(emb)
+
+    indexed.metadata_indexed = False
+    indexed.clip_indexed = False
+    indexed.clip_thumbnail_indexed = False
+    indexed.whisper_indexed = False
+    indexed.text_indexed = False
+    indexed.tfidf_keywords_indexed = False
 
 
 def _sync_thumbnail_paths(
