@@ -408,6 +408,22 @@
     }
   },
   "settings": {
+    "analysisPrompt": {
+      "title": "Analysis prompt",
+      "description": "The text Copy for AI puts above a video's transcript and comments. Paste the copy into an AI assistant to get a summary. It is only copied to your clipboard; Litloft sends nothing anywhere.",
+      "promptLabel": "Prompt",
+      "usingDefault": "The built-in prompt is in use.",
+      "usingCustom": "A custom prompt is in use.",
+      "save": "Save",
+      "saving": "Saving...",
+      "saved": "Saved",
+      "reset": "Reset to default",
+      "resetting": "Resetting...",
+      "resetSuccess": "Reset to the built-in prompt",
+      "loadFailed": "Failed to load",
+      "saveFailed": "Failed to save",
+      "resetFailed": "Failed to reset"
+    },
     "features": {
       "title": "Feature toggles",
       "description": "Turn indexing, search, and AI features on or off. Check cloud LLM costs and what data is sent to external APIs before choosing. Restart the container for changes to take effect.",

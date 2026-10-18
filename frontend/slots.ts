@@ -28,6 +28,7 @@ export const slotComponents: Record<string, React.LazyExoticComponent<React.Comp
   "folder-refine-transcripts": lazy(() => import("./FolderRefineButton")),
   "admin-transcription": lazy(() => import("./AdminTranscriptionSettingsSection")),
   "admin-features": lazy(() => import("./AdminFeaturesSettingsSection")),
+  "admin-analysis-prompt": lazy(() => import("./AdminAnalysisPromptSettingsSection")),
   "admin-llm": lazy(() => import("./AdminLLMSettingsSection")),
   "admin-rag": lazy(() => import("./AdminRAGSettingsSection")),
   "admin-embedding": lazy(() => import("./AdminEmbeddingSettingsSection")),

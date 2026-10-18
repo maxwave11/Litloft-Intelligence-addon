@@ -148,6 +148,11 @@
         "id": "admin-rag",
         "label": "RAG Behaviour",
         "priority": 15
+      },
+      {
+        "id": "admin-analysis-prompt",
+        "label": "Analysis Prompt",
+        "priority": 20
       }
     ],
     "file-actions-menu": [

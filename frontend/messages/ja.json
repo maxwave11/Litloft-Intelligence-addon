@@ -408,6 +408,22 @@
     }
   },
   "settings": {
+    "analysisPrompt": {
+      "title": "解析用プロンプト",
+      "description": "「Copy for AI」が動画の文字起こしとコメントの前に付けるテキストです。コピーしたものをAIアシスタントに貼り付けると要約が得られます。クリップボードにコピーするだけで、Litloftが外部へ送信することはありません。",
+      "promptLabel": "プロンプト",
+      "usingDefault": "標準のプロンプトを使用中です。",
+      "usingCustom": "カスタムのプロンプトを使用中です。",
+      "save": "保存",
+      "saving": "保存中...",
+      "saved": "保存しました",
+      "reset": "標準に戻す",
+      "resetting": "戻しています...",
+      "resetSuccess": "標準のプロンプトに戻しました",
+      "loadFailed": "読み込みに失敗しました",
+      "saveFailed": "保存に失敗しました",
+      "resetFailed": "標準に戻せませんでした"
+    },
     "features": {
       "title": "機能スイッチ",
       "description": "インデックス、検索、AI機能のオン/オフを切り替えます。クラウドLLMの費用や、外部APIへ送信されるデータを確認して設定してください。変更の反映にはコンテナの再起動が必要です。",
