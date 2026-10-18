@@ -46,7 +46,7 @@ from sqlalchemy.exc import OperationalError
 import app.config as config
 from app.config import settings
 from app import llm_routing
-from app.database import get_search_db
+from app.database import get_search_db, insert_vector
 from app.llm import (
     FAILURE_REQUEST_FAILED,
     FAILURE_VISION_UNSUPPORTED,
@@ -448,11 +448,12 @@ def _embed_and_store(file_id: str, description_text: str) -> None:
         )
         session.flush()
         try:
-            session.execute(
-                sql_text(
-                    "INSERT INTO vec_text(embedding_id, vector) VALUES(:id, :vec)"
-                ),
-                {"id": embedding_id, "vec": vec.tobytes()},
+            insert_vector(
+                session,
+                table="vec_text",
+                embedding_id=embedding_id,
+                file_id=file_id,
+                vector=vec.tobytes(),
             )
         except Exception as e:
             logger.warning(

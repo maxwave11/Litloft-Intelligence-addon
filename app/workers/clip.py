@@ -19,7 +19,7 @@ import numpy as np
 from PIL import Image
 
 from app.config import settings, validate_file_path
-from app.database import get_search_db
+from app.database import get_search_db, insert_vector
 from app.models import Embedding, IndexedFile
 from app.workers import blip
 from sqlalchemy import text as sql_text
@@ -1202,10 +1202,12 @@ def _store_clip_embedding(
     session.add(embedding_record)
     session.flush()
 
-    vec_bytes = vector.tobytes()
-    session.execute(
-        sql_text("INSERT INTO vec_clip(embedding_id, vector) VALUES(:id, :vec)"),
-        {"id": embedding_id, "vec": vec_bytes},
+    insert_vector(
+        session,
+        table="vec_clip",
+        embedding_id=embedding_id,
+        file_id=file_id,
+        vector=vector.tobytes(),
     )
 
 

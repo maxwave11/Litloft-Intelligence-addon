@@ -16,7 +16,12 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import get_search_db, upsert_fts_text_content, validate_vector_table
+from app.database import (
+    get_search_db,
+    insert_vector,
+    upsert_fts_text_content,
+    validate_vector_table,
+)
 from app.document_sections import replace_document_sections
 from app.extractors.base import ExtractionResult
 from app.extractors.epub import EpubExtractor
@@ -183,11 +188,12 @@ def _store_embedding(
 
     # Use session's connection (not a separate engine.connect()) to avoid
     # dual-connection conflicts with SQLite's single-writer constraint.
-    table = validate_vector_table(vector_table)
-    vec_bytes = vector.tobytes()
-    session.execute(
-        sql_text(f"INSERT INTO {table}(embedding_id, vector) VALUES(:id, :vec)"),
-        {"id": embedding_id, "vec": vec_bytes},
+    insert_vector(
+        session,
+        table=vector_table,
+        embedding_id=embedding_id,
+        file_id=file_id,
+        vector=vector.tobytes(),
     )
 
 

@@ -32,7 +32,7 @@ from typing import Any
 from sqlalchemy import text as sql_text
 
 import app.config as config
-from app.database import get_search_db, get_search_db_read
+from app.database import get_search_db, get_search_db_read, insert_vector
 from app.llm_routing import Resolved
 from app.models import Embedding, IndexedFile, TranscriptChunk, TranscriptWord
 from app.prompt_loader import render
@@ -499,12 +499,12 @@ async def recompute_chunk_embeddings(chunk_ids: list[int]) -> None:
             session.add(embedding_record)
             session.flush()
             try:
-                session.execute(
-                    sql_text(
-                        "INSERT INTO vec_text(embedding_id, vector) "
-                        "VALUES(:id, :vec)"
-                    ),
-                    {"id": embedding_id, "vec": vec.tobytes()},
+                insert_vector(
+                    session,
+                    table="vec_text",
+                    embedding_id=embedding_id,
+                    file_id=snap["file_id"],
+                    vector=vec.tobytes(),
                 )
             except Exception as e:
                 logger.warning(

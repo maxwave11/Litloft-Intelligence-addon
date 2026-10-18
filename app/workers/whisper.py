@@ -23,7 +23,13 @@ import uuid
 from datetime import UTC, datetime
 
 from app.config import settings, validate_file_path
-from app.database import delete_fts_transcripts, get_search_db, get_search_db_read, upsert_fts_transcripts
+from app.database import (
+    delete_fts_transcripts,
+    get_search_db,
+    get_search_db_read,
+    insert_vector,
+    upsert_fts_transcripts,
+)
 from app.models import (
     Embedding,
     IndexedFile,
@@ -1233,11 +1239,12 @@ def _index_tfidf_keywords(file_id: str, chunk_texts: list[str]) -> None:
         session.add(embedding_record)
         session.flush()
 
-        session.execute(
-            sql_text(
-                "INSERT INTO vec_text(embedding_id, vector) VALUES(:id, :vec)"
-            ),
-            {"id": embedding_id, "vec": vector.tobytes()},
+        insert_vector(
+            session,
+            table="vec_text",
+            embedding_id=embedding_id,
+            file_id=file_id,
+            vector=vector.tobytes(),
         )
 
         session.execute(
@@ -1406,11 +1413,12 @@ def _persist_transcript(
                     session.flush()
 
                     vec_bytes = vectors[text_idx].tobytes()
-                    session.execute(
-                        sql_text(
-                            "INSERT INTO vec_text(embedding_id, vector) VALUES(:id, :vec)"
-                        ),
-                        {"id": embedding_id, "vec": vec_bytes},
+                    insert_vector(
+                        session,
+                        table="vec_text",
+                        embedding_id=embedding_id,
+                        file_id=file_id,
+                        vector=vec_bytes,
                     )
 
                     text_idx += 1
@@ -1755,11 +1763,12 @@ def _index_loft_vtt(file_id: str, file_path: str) -> bool:
                     session.flush()
 
                     vec_bytes = vectors[text_idx].tobytes()
-                    session.execute(
-                        sql_text(
-                            "INSERT INTO vec_text(embedding_id, vector) VALUES(:id, :vec)"
-                        ),
-                        {"id": embedding_id, "vec": vec_bytes},
+                    insert_vector(
+                        session,
+                        table="vec_text",
+                        embedding_id=embedding_id,
+                        file_id=file_id,
+                        vector=vec_bytes,
                     )
                     text_idx += 1
                 except Exception as e:
