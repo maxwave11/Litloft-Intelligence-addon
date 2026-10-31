@@ -17,13 +17,20 @@ import asyncio
 import logging
 import os
 import re
+import subprocess
 import threading
 import time
+import unicodedata
 import uuid
 from datetime import UTC, datetime
 
+import numpy as np
+
+from app.vec_partition import insert_vector_sql
 from app.config import settings, validate_file_path
+from app.digit_separator import is_digit_separator
 from app.database import delete_fts_transcripts, get_search_db, get_search_db_read, upsert_fts_transcripts
+from app.idf_backfill import mark_idf_terms_stale
 from app.models import (
     Embedding,
     IndexedFile,
@@ -31,6 +38,7 @@ from app.models import (
     TranscriptChunk,
     TranscriptWord,
 )
+from app.sidecar_match import match_siblings
 from app.workers.embedder import embed_passages
 from app.workers.transcription import get_provider
 from app.workers.transcription.errors import (
@@ -117,9 +125,11 @@ def _loft_stt_temp_path(file_path: str) -> str | None:
 
     loft_path = Path(file_path)
     candidate = loft_path.parent / f"{loft_path.stem}{LOFT_STT_TEMP_SUFFIX}"
-    if candidate.is_file():
-        return str(candidate)
-    return None
+    try:
+        found = candidate.is_file()
+    except OSError:
+        return None
+    return str(candidate) if found else None
 
 
 def _cleanup_loft_stt_temp(file_path: str | None) -> None:
@@ -188,7 +198,7 @@ def _ensure_loaded() -> tuple[object, object | None]:
                 download_root=cache_dir,
             )
 
-            batch_size = settings.indexing.whisper.batch_size
+            batch_size = settings.transcription.whisper_local.batch_size
             if batch_size > 0:
                 _batched_pipeline = BatchedInferencePipeline(model=_model)
                 logger.info("Batched inference enabled (batch_size=%d)", batch_size)
@@ -273,16 +283,66 @@ def check_idle_unload() -> None:
 _LANG_DETECT_MIN_PROB = 0.5
 
 
+# Long enough to reach speech after a music or silent opening; decoding the
+# whole file would cost about 1 GB for an unsplit file several hours long.
+_LANG_DETECT_SECONDS = 120
+_LANG_DETECT_DECODE_TIMEOUT_S = 60
+# faster-whisper 1.1.0 answers en ~0.61 (above _LANG_DETECT_MIN_PROB) when
+# VAD leaves nothing, and a VAD false positive leaves almost nothing; 1 s of
+# real speech was enough on every clip measured.
+_LANG_DETECT_MIN_SPEECH_S = 1.0
+
+
+def _decode_detection_sample(file_path: str, sampling_rate: int) -> np.ndarray:
+    """Decode the first ``_LANG_DETECT_SECONDS`` of ``file_path`` to mono float32."""
+    result = subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-v", "error",
+            "-t", str(_LANG_DETECT_SECONDS), "-i", file_path,
+            "-vn", "-ac", "1", "-ar", str(sampling_rate),
+            "-f", "f32le", "-",
+        ],
+        capture_output=True,
+        timeout=_LANG_DETECT_DECODE_TIMEOUT_S,
+        check=True,
+    )
+    return np.frombuffer(result.stdout, dtype=np.float32)
+
+
+def _speech_seconds(audio: np.ndarray, sampling_rate: int) -> float:
+    """Total length of the speech Silero VAD finds in ``audio``."""
+    from faster_whisper.vad import get_speech_timestamps
+
+    chunks = get_speech_timestamps(audio, sampling_rate=sampling_rate)
+    return sum(c["end"] - c["start"] for c in chunks) / sampling_rate
+
+
 def _detect_language(model: object, file_path: str) -> str | None:
     """Run Whisper's lightweight language detector on a media file.
 
-    Uses faster-whisper's ``detect_language`` which only consumes a
-    short audio sample (~30 s), so the cost relative to a full
-    transcription is negligible. Returns ``None`` on low confidence
-    or any failure — callers must tolerate an absent language.
+    Returns ``None`` on low confidence, when the first
+    ``_LANG_DETECT_SECONDS`` hold too little speech, or on any failure —
+    callers must tolerate an absent language.
     """
     try:
-        language, probability, _ = model.detect_language(file_path)
+        sampling_rate = model.feature_extractor.sampling_rate
+        audio = _decode_detection_sample(file_path, sampling_rate)
+        if audio.size == 0:
+            logger.info(
+                "Language detection skipped for %s: no audio in the first %ds",
+                file_path, _LANG_DETECT_SECONDS,
+            )
+            return None
+        speech = _speech_seconds(audio, sampling_rate)
+        if speech < _LANG_DETECT_MIN_SPEECH_S:
+            logger.info(
+                "Language detection skipped for %s: %.1fs of speech in the first %ds",
+                file_path, speech, _LANG_DETECT_SECONDS,
+            )
+            return None
+        language, probability, _ = model.detect_language(
+            audio=audio, vad_filter=True
+        )
     except Exception as e:
         logger.warning(
             "Language detection failed for %s: %s", file_path, e
@@ -320,7 +380,7 @@ def _transcribe_file(
         List of segment dicts with keys: text, start, end, language.
     """
     model, batched = _ensure_loaded()
-    whisper_config = settings.indexing.whisper
+    whisper_config = settings.transcription.whisper_local
 
     if initial_prompt_override and initial_prompt_override.strip():
         # Phase 2B precedence (1): caller-supplied prior text wins
@@ -483,6 +543,12 @@ def _transcribe_sequential(
 
             return segments
 
+        except (TypeError, AttributeError, ImportError) as e:
+            # A dependency's API changing under us fails every file. Closing
+            # each one as a zero-segment success would hide that.
+            raise FatalError(
+                f"faster-whisper could not run on {file_path}: {e}"
+            ) from e
         except (IndexError, RuntimeError) as e:
             if attempt == 0:
                 logger.warning(
@@ -570,13 +636,19 @@ def _build_chunks_from_words(
     if not words:
         return []
 
-    def _is_break(word_text: str, gap_to_next: float) -> int:
+    def _is_break(i: int, gap_to_next: float) -> int:
         """Return 2 for hard break, 1 for soft break, 0 otherwise."""
-        if word_text and word_text[-1] in _PUNCT_BREAK:
+        word_text = words[i]["text"]
+        punctuation = bool(word_text) and not is_digit_separator(
+            words[i - 1]["text"] if i > 0 else None,
+            word_text,
+            words[i + 1]["text"] if i + 1 < len(words) else None,
+        )
+        if punctuation and word_text[-1] in _PUNCT_BREAK:
             return 2
         if gap_to_next >= _SILENCE_GAP:
             return 2
-        if word_text and word_text[-1] in _PUNCT_SOFT:
+        if punctuation and word_text[-1] in _PUNCT_SOFT:
             return 1
         return 0
 
@@ -591,7 +663,7 @@ def _build_chunks_from_words(
         duration = chunk_end - chunk_start
         next_start = words[i + 1]["start"] if i + 1 < len(words) else chunk_end
         gap = max(0.0, next_start - chunk_end)
-        break_strength = _is_break(word["text"], gap)
+        break_strength = _is_break(i, gap)
 
         # R4 (Phase 1C): speaker change between this word and the next
         # is treated as a hard boundary, but only past min_duration so
@@ -1234,10 +1306,8 @@ def _index_tfidf_keywords(file_id: str, chunk_texts: list[str]) -> None:
         session.flush()
 
         session.execute(
-            sql_text(
-                "INSERT INTO vec_text(embedding_id, vector) VALUES(:id, :vec)"
-            ),
-            {"id": embedding_id, "vec": vector.tobytes()},
+            sql_text(insert_vector_sql("vec_text")),
+            {"id": embedding_id, "type": "tfidf_keywords", "vec": vector.tobytes()},
         )
 
         session.execute(
@@ -1407,10 +1477,8 @@ def _persist_transcript(
 
                     vec_bytes = vectors[text_idx].tobytes()
                     session.execute(
-                        sql_text(
-                            "INSERT INTO vec_text(embedding_id, vector) VALUES(:id, :vec)"
-                        ),
-                        {"id": embedding_id, "vec": vec_bytes},
+                        sql_text(insert_vector_sql("vec_text")),
+                        {"id": embedding_id, "type": "whisper", "vec": vec_bytes},
                     )
 
                     text_idx += 1
@@ -1496,6 +1564,10 @@ def _remove_whisper_data(session: object, file_id: str) -> None:
         session: Database session.
         file_id: The file ID.
     """
+    # First, so a caller that commits after a later statement raises
+    # still records that the transcript changed.
+    mark_idf_terms_stale(session, file_id)
+
     # Remove transcript chunks, word-level rows, and FTS5 mirror
     session.query(TranscriptChunk).filter_by(file_id=file_id).delete()
     session.query(TranscriptWord).filter_by(file_id=file_id).delete()
@@ -1675,7 +1747,11 @@ def _index_loft_vtt(file_id: str, file_path: str) -> bool:
     stem = loft_path.stem
     parent = loft_path.parent
 
-    vtt_candidates = sorted(parent.glob(f"{stem}*.vtt"))
+    try:
+        vtt_candidates = match_siblings(parent, stem, "*.vtt")
+    except OSError as exc:
+        logger.warning("Cannot list the folder of loft ref %s: %s", file_id, exc)
+        vtt_candidates = []
     if not vtt_candidates:
         logger.info("No adjacent VTT for loft ref %s, marking as indexed", file_id)
         with get_search_db() as session:
@@ -1684,11 +1760,11 @@ def _index_loft_vtt(file_id: str, file_path: str) -> bool:
                 file.whisper_indexed = True
         return True
 
-    best_vtt = vtt_candidates[0]
-    for c in vtt_candidates:
-        if c.name == f"{stem}.vtt":
-            best_vtt = c
-            break
+    exact_name = unicodedata.normalize("NFC", f"{stem}.vtt")
+    best_vtt = next(
+        (c for c in vtt_candidates if unicodedata.normalize("NFC", c.name) == exact_name),
+        vtt_candidates[0],
+    )
 
     raw_segments = _dedup_rolling_cues(_parse_vtt_cues(str(best_vtt)))
     if not raw_segments:
@@ -1699,7 +1775,7 @@ def _index_loft_vtt(file_id: str, file_path: str) -> bool:
                 file.whisper_indexed = True
         return True
 
-    whisper_config = settings.indexing.whisper
+    whisper_config = settings.transcription.whisper_local
     chunks = _merge_segments(
         raw_segments,
         whisper_config.min_segment_duration,
@@ -1756,10 +1832,8 @@ def _index_loft_vtt(file_id: str, file_path: str) -> bool:
 
                     vec_bytes = vectors[text_idx].tobytes()
                     session.execute(
-                        sql_text(
-                            "INSERT INTO vec_text(embedding_id, vector) VALUES(:id, :vec)"
-                        ),
-                        {"id": embedding_id, "vec": vec_bytes},
+                        sql_text(insert_vector_sql("vec_text")),
+                        {"id": embedding_id, "type": "whisper", "vec": vec_bytes},
                     )
                     text_idx += 1
                 except Exception as e:

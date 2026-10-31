@@ -14,7 +14,8 @@ Public surface (called by ``app.routers.refine`` and tested directly):
 * ``realign_words_for_chunk(session, file_id, chunk_start, chunk_end,
   refined_text) -> int``
 * ``recompute_chunk_embeddings(chunk_ids)``
-* ``start_refine_job(session, file_id, resolved) -> str`` (sync)
+* ``refine_chunk_ids(session, file_id) -> list[int]``
+* ``start_refine_job(file_id, chunk_ids, resolved) -> str`` (sync, needs a running loop)
 * ``filter_transcript_file_ids(session, drive, file_ids) -> list[str]``
 * ``is_feature_enabled(drive) -> bool``
 """
@@ -32,7 +33,9 @@ from typing import Any
 from sqlalchemy import text as sql_text
 
 import app.config as config
-from app.database import get_search_db, get_search_db_read
+from app.vec_partition import insert_vector_sql
+from app.database import get_search_db, get_search_db_read, upsert_fts_transcripts
+from app.idf_backfill import mark_idf_terms_stale
 from app.llm_routing import Resolved
 from app.models import Embedding, IndexedFile, TranscriptChunk, TranscriptWord
 from app.prompt_loader import render
@@ -112,13 +115,16 @@ def _parse_llm_response(
     for entry in items:
         if not isinstance(entry, dict):
             return None
-        if "id" not in entry or "text_refined" not in entry:
+        # Local models answer under the input's key ``text`` instead of
+        # the requested ``text_refined``.
+        key = "text_refined" if "text_refined" in entry else "text"
+        if "id" not in entry or key not in entry:
             return None
         try:
             cid = int(entry["id"])
         except (TypeError, ValueError):
             return None
-        refined = entry.get("text_refined")
+        refined = entry.get(key)
         if not isinstance(refined, str):
             return None
         by_id[cid] = refined
@@ -378,6 +384,7 @@ def rechunk_from_words(
         session.delete(emb)
 
     session.query(TranscriptChunk).filter_by(file_id=file_id).delete()
+    mark_idf_terms_stale(session, file_id)
     session.flush()
 
     now = datetime.now(UTC)
@@ -405,6 +412,26 @@ def rechunk_from_words(
         new_ids.append(int(row.id))
 
     return new_ids
+
+
+def _reindex_keywords(session: Any, file_id: str) -> None:
+    """Replace the file's keyword index rows with its current chunk rows."""
+    session.flush()
+    chunks = (
+        session.query(TranscriptChunk.chunk_index, TranscriptChunk.text)
+        .filter(TranscriptChunk.file_id == file_id)
+        .order_by(TranscriptChunk.chunk_index)
+        .all()
+    )
+    upsert_fts_transcripts(
+        session,
+        file_id,
+        [
+            {"chunk_index": idx, "text": text}
+            for idx, text in chunks
+            if (text or "").strip()
+        ],
+    )
 
 
 # --- Embedding re-compute ---------------------------------------------------
@@ -435,23 +462,26 @@ async def recompute_chunk_embeddings(chunk_ids: list[int]) -> None:
 
     # Snapshot under a read session: plain SELECTs need no write lock, and
     # the ORM rows must not outlive it.
-    with get_search_db_read() as session:
-        rows = (
-            session.query(TranscriptChunk)
-            .filter(TranscriptChunk.id.in_(chunk_ids))
-            .all()
-        )
-        snapshots = [
-            {
-                "id": int(r.id),
-                "file_id": r.file_id,
-                "chunk_index": r.chunk_index,
-                "text": r.text or "",
-                "timestamp_start": r.timestamp_start,
-                "timestamp_end": r.timestamp_end,
-            }
-            for r in rows
-        ]
+    def _snapshot() -> list[dict]:
+        with get_search_db_read() as session:
+            rows = (
+                session.query(TranscriptChunk)
+                .filter(TranscriptChunk.id.in_(chunk_ids))
+                .all()
+            )
+            return [
+                {
+                    "id": int(r.id),
+                    "file_id": r.file_id,
+                    "chunk_index": r.chunk_index,
+                    "text": r.text or "",
+                    "timestamp_start": r.timestamp_start,
+                    "timestamp_end": r.timestamp_end,
+                }
+                for r in rows
+            ]
+
+    snapshots = await asyncio.to_thread(_snapshot)
 
     texts = [snap["text"] for snap in snapshots]
     if not any(t.strip() for t in texts):
@@ -464,52 +494,52 @@ async def recompute_chunk_embeddings(chunk_ids: list[int]) -> None:
         logger.warning("refine: embed_passages failed (%s)", e)
         return
 
-    with get_search_db() as session:
-        for snap, vec in zip(snapshots, vectors, strict=False):
-            existing = (
-                session.query(Embedding)
-                .filter(
-                    Embedding.file_id == snap["file_id"],
-                    Embedding.embedding_type == "whisper",
-                    Embedding.timestamp_start == snap["timestamp_start"],
-                    Embedding.timestamp_end == snap["timestamp_end"],
+    def _store() -> None:
+        with get_search_db() as session:
+            for snap, vec in zip(snapshots, vectors, strict=False):
+                existing = (
+                    session.query(Embedding)
+                    .filter(
+                        Embedding.file_id == snap["file_id"],
+                        Embedding.embedding_type == "whisper",
+                        Embedding.timestamp_start == snap["timestamp_start"],
+                        Embedding.timestamp_end == snap["timestamp_end"],
+                    )
+                    .all()
                 )
-                .all()
-            )
-            for emb in existing:
-                session.execute(
-                    sql_text("DELETE FROM vec_text WHERE embedding_id = :id"),
-                    {"id": emb.id},
-                )
-                session.delete(emb)
+                for emb in existing:
+                    session.execute(
+                        sql_text("DELETE FROM vec_text WHERE embedding_id = :id"),
+                        {"id": emb.id},
+                    )
+                    session.delete(emb)
 
-            embedding_id = (
-                f"wh_{snap['file_id']}_{snap['chunk_index']}_"
-                f"{uuid.uuid4().hex[:8]}"
-            )
-            embedding_record = Embedding(
-                id=embedding_id,
-                file_id=snap["file_id"],
-                embedding_type="whisper",
-                vector_table="vec_text",
-                content_preview=snap["text"][:200],
-                timestamp_start=snap["timestamp_start"],
-                timestamp_end=snap["timestamp_end"],
-            )
-            session.add(embedding_record)
-            session.flush()
-            try:
-                session.execute(
-                    sql_text(
-                        "INSERT INTO vec_text(embedding_id, vector) "
-                        "VALUES(:id, :vec)"
-                    ),
-                    {"id": embedding_id, "vec": vec.tobytes()},
+                embedding_id = (
+                    f"wh_{snap['file_id']}_{snap['chunk_index']}_"
+                    f"{uuid.uuid4().hex[:8]}"
                 )
-            except Exception as e:
-                logger.warning(
-                    "refine: vec_text insert failed for %s: %s", snap["id"], e
+                embedding_record = Embedding(
+                    id=embedding_id,
+                    file_id=snap["file_id"],
+                    embedding_type="whisper",
+                    vector_table="vec_text",
+                    content_preview=snap["text"][:200],
+                    timestamp_start=snap["timestamp_start"],
+                    timestamp_end=snap["timestamp_end"],
                 )
+                session.add(embedding_record)
+                session.flush()
+                try:
+                    session.execute(
+                        sql_text(insert_vector_sql("vec_text")),
+                        {"id": embedding_id, "type": "whisper", "vec": vec.tobytes()},
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "refine: vec_text insert failed for %s: %s", snap["id"], e
+                    )
+
+    await asyncio.to_thread(_store)
 
 
 # --- Folder scan + policy ---------------------------------------------------
@@ -654,8 +684,7 @@ async def _run_refine_job(
     # intelligence endpoint (including /status) for the entire job.
     from types import SimpleNamespace
 
-    audio_path: str | None = None
-    try:
+    def _snapshot() -> tuple[list[SimpleNamespace], str | None]:
         with get_search_db() as session:
             rows = (
                 session.query(TranscriptChunk)
@@ -679,8 +708,10 @@ async def _run_refine_job(
             file_row = (
                 session.query(IndexedFile).filter_by(file_id=file_id).first()
             )
-            if file_row is not None:
-                audio_path = file_row.file_path
+            return snapshots, (file_row.file_path if file_row is not None else None)
+
+    try:
+        snapshots, audio_path = await asyncio.to_thread(_snapshot)
     except Exception as e:
         logger.exception("refine job snapshot failed for %s", file_id)
         await _emit_ws_event(
@@ -720,7 +751,7 @@ async def _run_refine_job(
         with aligner.job_scope():
             waveform: Any = None
             if audio_path and validate_file_path(audio_path):
-                waveform = aligner.load_waveform(audio_path)
+                waveform = await asyncio.to_thread(aligner.load_waveform, audio_path)
 
             for offset in range(0, total, WINDOW_SIZE):
                 window = snapshots[offset : offset + WINDOW_SIZE]
@@ -737,38 +768,45 @@ async def _run_refine_job(
                 if refined_window:
                     # Short-lived session per window: apply mutations and
                     # realign words, then release the lock before re-embedding.
-                    applied_ids = []
-                    with get_search_db() as session:
-                        fresh = (
-                            session.query(TranscriptChunk)
-                            .filter(
-                                TranscriptChunk.id.in_(
-                                    [s.id for s in refined_window]
+                    def _apply(window_=refined_window) -> list[int]:
+                        nonlocal aligned_total, aligner_skipped_total
+                        applied_ids: list[int] = []
+                        with get_search_db() as session:
+                            fresh = (
+                                session.query(TranscriptChunk)
+                                .filter(
+                                    TranscriptChunk.id.in_(
+                                        [s.id for s in window_]
+                                    )
                                 )
+                                .all()
                             )
-                            .all()
-                        )
-                        by_id = {int(c.id): c for c in fresh}
-                        for snap in refined_window:
-                            orm = by_id.get(snap.id)
-                            if orm is None:
-                                continue
-                            orm.text = snap.text
-                            orm.text_refined_at = snap.text_refined_at
-                            orm.refined_model = snap.refined_model
-                            aligned = realign_words_for_chunk(
-                                session,
-                                orm.file_id,
-                                orm.timestamp_start,
-                                orm.timestamp_end,
-                                orm.text,
-                                waveform=waveform,
-                            )
-                            if aligned > 0:
-                                aligned_total += 1
-                            else:
-                                aligner_skipped_total += 1
-                            applied_ids.append(int(orm.id))
+                            by_id = {int(c.id): c for c in fresh}
+                            for snap in window_:
+                                orm = by_id.get(snap.id)
+                                if orm is None:
+                                    continue
+                                orm.text = snap.text
+                                orm.text_refined_at = snap.text_refined_at
+                                orm.refined_model = snap.refined_model
+                                aligned = realign_words_for_chunk(
+                                    session,
+                                    orm.file_id,
+                                    orm.timestamp_start,
+                                    orm.timestamp_end,
+                                    orm.text,
+                                    waveform=waveform,
+                                )
+                                if aligned > 0:
+                                    aligned_total += 1
+                                else:
+                                    aligner_skipped_total += 1
+                                applied_ids.append(int(orm.id))
+                            _reindex_keywords(session, file_id)
+                            mark_idf_terms_stale(session, file_id)
+                        return applied_ids
+
+                    applied_ids = await asyncio.to_thread(_apply)
 
                     # Outside the write block: recompute_chunk_embeddings()
                     # embeds off-thread and takes the lock itself.
@@ -792,11 +830,16 @@ async def _run_refine_job(
             # would churn IDs for no RAG benefit.
             rechunked_count = 0
             if refined_total > 0:
-                new_ids: list[int] = []
-                with get_search_db() as session:
-                    new_ids = rechunk_from_words(
-                        session, file_id, refined_model=resolved.profile.config.model
-                    ) or []
+                def _rechunk() -> list[int]:
+                    with get_search_db() as session:
+                        new_ids = rechunk_from_words(
+                            session, file_id, refined_model=resolved.profile.config.model
+                        ) or []
+                        if new_ids:
+                            _reindex_keywords(session, file_id)
+                        return new_ids
+
+                new_ids = await asyncio.to_thread(_rechunk)
                 if new_ids:
                     await recompute_chunk_embeddings(new_ids)
                     rechunked_count = len(new_ids)
@@ -823,34 +866,24 @@ async def _run_refine_job(
         _active_refine_files.discard(file_id)
 
 
-def start_refine_job(session: Any, file_id: str, resolved: Resolved) -> str:
-    """Kick off an async refine job. Returns the generated job_id.
-
-    Deliberately synchronous: the body only reads chunk ids and spawns a
-    task, and callers hold the search-DB write lock while calling it.
-    Awaiting under that lock would risk wedging the event loop (see the
-    INVARIANT note on ``app.database._write_lock``).
-    """
-    job_id = uuid.uuid4().hex
-
-    chunk_ids: list[int] = []
+def refine_chunk_ids(session: Any, file_id: str) -> list[int]:
+    """Chunk ids a refine job for ``file_id`` will snapshot."""
     try:
         rows = (
             session.query(TranscriptChunk.id)
             .filter(TranscriptChunk.file_id == file_id)
             .all()
         )
-        chunk_ids = [int(r[0]) for r in rows] if rows else []
+        return [int(r[0]) for r in rows] if rows else []
     except Exception:
-        chunk_ids = []
+        return []
 
-    try:
-        asyncio.create_task(
-            _run_refine_job(file_id, job_id, chunk_ids, resolved),
-            name=f"refine_job_{job_id}",
-        )
-    except RuntimeError:
-        # No running loop (e.g. unit-test context without asyncio).
-        pass
 
+def start_refine_job(file_id: str, chunk_ids: list[int], resolved: Resolved) -> str:
+    """Kick off an async refine job on the running loop. Returns the job_id."""
+    job_id = uuid.uuid4().hex
+    asyncio.create_task(
+        _run_refine_job(file_id, job_id, chunk_ids, resolved),
+        name=f"refine_job_{job_id}",
+    )
     return job_id

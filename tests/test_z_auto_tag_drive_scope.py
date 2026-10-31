@@ -16,6 +16,8 @@ surface while tagging a file in drive A.
 from __future__ import annotations
 
 import logging
+import math
+import os
 import sys
 from contextlib import contextmanager
 from unittest.mock import MagicMock
@@ -31,8 +33,10 @@ from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from app import tfidf as tfidf_mod  # noqa: E402
-from app.models import Base, Embedding, IndexedFile  # noqa: E402
+from app.models import Base, Embedding, IndexedFile, TranscriptChunk  # noqa: E402
 from app.workers import clip_concepts, tag_knn  # noqa: E402
+from tests import idf_backfill_api as backfill  # noqa: E402
+from tests.idf_doubles import PidTokenizer, WordTokenizer  # noqa: E402
 
 DIM = 4
 
@@ -140,6 +144,11 @@ def index(monkeypatch, tmp_path):
     monkeypatch.setattr(tag_knn, "get_litloft_db", idx.litloft_db)
     monkeypatch.setattr(clip_concepts, "get_litloft_db", idx.litloft_db)
     monkeypatch.setattr(tfidf_mod, "get_search_db_read", idx.search_db)
+    monkeypatch.setattr("app.database._search_engine", idx.engine)
+    monkeypatch.setattr("app.database._SearchSession", idx._maker)
+    from app.indexer import IndexManager
+
+    monkeypatch.setattr("app.dependencies._index_manager", IndexManager())
     # sqlite-vec's MATCH is not available here; order by the stored
     # distance column instead, which is what MATCH would have produced.
     monkeypatch.setattr(
@@ -277,6 +286,19 @@ def test_concept_cache_is_keyed_by_drive(
 # ---------------------------------------------------------------------------
 
 
+def _say(index, file_id: str, words: str) -> None:
+    session = index._maker()
+    try:
+        session.add(TranscriptChunk(
+            file_id=file_id, chunk_index=0, text=words,
+            timestamp_start=0.0, timestamp_end=1.0,
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+
+# SPEC-ADDON-021
 def test_document_frequency_counts_only_the_drives_own_files(index, monkeypatch):
     """``min_doc_freq`` must not be satisfied by files in another drive."""
     index.add_file("a1", "a", distance=None)
@@ -284,12 +306,13 @@ def test_document_frequency_counts_only_the_drives_own_files(index, monkeypatch)
         index.add_file(f"b{i}", "b", distance=None)
 
     # "共通語" is the whole of drive a, but one file in three in drive b.
-    monkeypatch.setattr(
-        tfidf_mod,
-        "_tokenize_file",
-        lambda fid, fn, tok: ["共通語"] if fid in ("a1", "b0") else ["他"],
-    )
+    for fid in ("a1", "b0"):
+        _say(index, fid, "共通語 " * 10)
+    for fid in ("b1", "b2"):
+        _say(index, fid, "別の話題 " * 10)
+    monkeypatch.setattr(tfidf_mod, "_TOKENIZER_FACTORY", WordTokenizer)
     tfidf_mod.reset_corpus_idf_cache()
+    backfill.run_pass()
 
     idf_a, n_docs_a = tfidf_mod._build_corpus_idf("a")
     idf_b, n_docs_b = tfidf_mod._build_corpus_idf("b")
@@ -301,3 +324,72 @@ def test_document_frequency_counts_only_the_drives_own_files(index, monkeypatch)
     assert idf_a["共通語"] == pytest.approx(1.0)
     assert idf_b["共通語"] > idf_a["共通語"]
     tfidf_mod.reset_corpus_idf_cache()
+
+
+def _put_file(index, file_id: str, filename: str, *, active: bool = True) -> None:
+    session = index._maker()
+    try:
+        session.add(IndexedFile(
+            file_id=file_id, drive="a", filename=filename,
+            file_path=f"/drives/a/{filename}", file_type="video",
+            mime_type="video/mp4", file_size=1, active=active,
+        ))
+        session.commit()
+    finally:
+        session.close()
+
+
+# SPEC-ADDON-021
+def test_the_idf_counts_every_batch_and_only_active_files_with_words(
+    index, monkeypatch,
+):
+    monkeypatch.setattr(tfidf_mod, "_CORPUS_BATCH_FILES", 2)
+    monkeypatch.setattr(tfidf_mod, "_TOKENIZER_FACTORY", WordTokenizer)
+    for fid, filename, words in [
+        ("k1", "1.mp4", "共通語 " * 10),
+        ("k2", "2.mp4", "共通語 " * 10),
+        ("k3", "3.mp4", "珍語 " * 10),
+        ("k4", "題名.mp4", None),
+        ("k5", "5.mp4", "短い"),
+    ]:
+        _put_file(index, fid, filename)
+        if words is not None:
+            _say(index, fid, words)
+    _put_file(index, "k6", "6.mp4", active=False)
+    _say(index, "k6", "共通語 " * 10)
+    backfill.run_pass()
+
+    idf, n_docs = tfidf_mod._build_corpus_idf("a")
+
+    assert n_docs == 4
+    assert idf == pytest.approx({
+        "共通語": math.log(2) + 1.0,
+        "珍語": math.log(4) + 1.0,
+        "題名": math.log(4) + 1.0,
+    })
+
+
+# SPEC-ADDON-021
+def test_the_corpus_is_tokenized_in_a_spawned_process(index, monkeypatch):
+    """Tokenizing a drive takes minutes of pure-Python CPU; inside this
+    process it would hold the GIL against every thread that reads rows.
+    A fork would copy locks other threads hold at that instant."""
+    index.add_file("a1", "a", distance=None)
+    _say(index, "a1", "共通語 " * 10)
+    monkeypatch.setattr(tfidf_mod, "_TOKENIZER_FACTORY", PidTokenizer)
+    methods = []
+    real_get_context = tfidf_mod.multiprocessing.get_context
+
+    def recording_get_context(method=None):
+        methods.append(method)
+        return real_get_context(method)
+
+    monkeypatch.setattr(tfidf_mod.multiprocessing, "get_context", recording_get_context)
+
+    backfill.run_pass()
+    idf, _ = tfidf_mod._build_corpus_idf("a")
+
+    pid_tokens = {t for t in idf if t.startswith("pid")}
+    assert pid_tokens
+    assert f"pid{os.getpid()}" not in pid_tokens
+    assert methods == ["spawn"]

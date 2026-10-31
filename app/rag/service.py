@@ -52,6 +52,7 @@ from app.rag.category_expander import expand_category
 from app.rag.clue_generator import fetch_long_summaries, generate_clues
 from app.rag.coarse_retriever import ShortlistResult, coarse_retrieve
 from app.rag.context import assemble_contexts
+from app.rag.exact_match import lookup_exact_match_files
 from app.rag.history_client import fetch_viewer_history
 from app.rag.parser import Citation, _parse_citation, parse_answer
 from app.rag.prompt import build_system_prompt, build_user_prompt
@@ -302,7 +303,7 @@ def _quote_from_contexts(
                     chosen = snippet
                     break
 
-        text = chosen.text.strip()
+        text = chosen.text[getattr(chosen, "anchor", 0):].strip()
         if len(text) > max_chars:
             text = text[:max_chars].rstrip() + "…"
         return text
@@ -823,6 +824,24 @@ async def _run_hierarchical_retrieval(
         )
         return candidates, None, None
 
+    # Rare keyword tokens add the files that mention them, which the
+    # summary embeddings miss. They go through the same access filter as
+    # the coarse files but never reach the clue generator.
+    exact_match_ids: tuple[str, ...] = ()
+    if cfg.exact_match_max_files > 0:
+        coarse_set = set(shortlist.file_ids)
+        pre_scope_set = (
+            None if pre_scope_file_ids is None else set(pre_scope_file_ids)
+        )
+        exact_match_ids = tuple(
+            fid
+            for fid in await lookup_exact_match_files(
+                keywords, drive, max_files=cfg.exact_match_max_files
+            )
+            if fid not in coarse_set
+            and (pre_scope_set is None or fid in pre_scope_set)
+        )
+
     # Access-filter the shortlist BEFORE forwarding it anywhere. The
     # coarse retriever is drive-scoped but does not consult the host's
     # per-drive locked/unlocked state — a caller without the unlock
@@ -832,9 +851,9 @@ async def _run_hierarchical_retrieval(
     # but the SSE event the streaming path emits is built from the
     # ShortlistResult and must reflect the same gate).
     accessible = await _filter_file_ids_via_internal_api(
-        list(shortlist.file_ids), credential
+        [*shortlist.file_ids, *exact_match_ids], credential
     )
-    if not accessible:
+    if not any(fid in accessible for fid in shortlist.file_ids):
         # Whole shortlist is inaccessible (locked protected drive,
         # transient internal-API failure that fails closed, etc.).
         # Treat as a bypass: run the legacy path scoped to
@@ -874,7 +893,11 @@ async def _run_hierarchical_retrieval(
         scores=filtered_scores,
         top_score=filtered_scores[0] if filtered_scores else 0.0,
         drive_file_count=shortlist.drive_file_count,
+        exact_match_file_ids=tuple(
+            fid for fid in exact_match_ids if fid in accessible
+        ),
     )
+    scope_ids = [*filtered_shortlist.file_ids, *filtered_shortlist.exact_match_file_ids]
 
     # Stage 2: clue generation. Pull the AI summaries for the
     # access-filtered shortlist and ask the LLM to expand the query
@@ -885,7 +908,9 @@ async def _run_hierarchical_retrieval(
     # ``[keywords]`` so the downstream loop runs the equivalent of the
     # legacy single-keyword path without any branching here.
     clue_count = max(1, cfg.clue_count)
-    summary_map = fetch_long_summaries(list(filtered_shortlist.file_ids))
+    summary_map = await asyncio.to_thread(
+        fetch_long_summaries, list(filtered_shortlist.file_ids)
+    )
     summaries = [
         summary_map[fid]
         for fid in filtered_shortlist.file_ids
@@ -911,7 +936,7 @@ async def _run_hierarchical_retrieval(
                 file_type=file_type,
                 drive=drive,
                 original_query=semantic,
-                file_id_scope=list(filtered_shortlist.file_ids),
+                file_id_scope=scope_ids,
                 required=required,
             )
             for clue in clues
@@ -1248,7 +1273,9 @@ async def _answer_question(
         )
 
     # Stage 2: build per-file contexts under budget.
-    contexts = assemble_contexts(candidates, rag_config, query=query)
+    contexts = await asyncio.to_thread(
+        assemble_contexts, candidates, rag_config, query=query
+    )
 
     # Stage 3: LLM call.
     llm = llm_routing.bound_client()
@@ -1280,9 +1307,12 @@ async def _answer_question(
             took_ms=int((time.monotonic() - start) * 1000),
         )
 
-    citations = [
-        _to_citation_dict(c, candidates, contexts=contexts) for c in parsed.citations
-    ]
+    citations = await asyncio.to_thread(
+        lambda: [
+            _to_citation_dict(c, candidates, contexts=contexts)
+            for c in parsed.citations
+        ]
+    )
 
     return AnswerResponse(
         query=query,
@@ -1669,7 +1699,11 @@ async def _stream_answer(
         yield AnswerEvent(
             kind="shortlist",
             data={
-                "file_ids": list(shortlist.file_ids),
+                "file_ids": [
+                    *shortlist.file_ids,
+                    *shortlist.exact_match_file_ids,
+                ],
+                "exact_match_file_ids": list(shortlist.exact_match_file_ids),
                 "drive_file_count": shortlist.drive_file_count,
                 "top_score": shortlist.top_score,
             },
@@ -1694,7 +1728,9 @@ async def _stream_answer(
         return
 
     # Stage 2: build per-file contexts under budget.
-    contexts = assemble_contexts(candidates, rag_config, query=query)
+    contexts = await asyncio.to_thread(
+        assemble_contexts, candidates, rag_config, query=query
+    )
 
     # Stage 3: stream the LLM answer.
     llm = llm_routing.bound_client()
@@ -1749,7 +1785,8 @@ async def _stream_answer(
                         kind="answer_chunk", data={"delta": cleaned}
                     )
             for raw in citation_extractor.feed(delta):
-                event = _build_progressive_citation_event(
+                event = await asyncio.to_thread(
+                    _build_progressive_citation_event,
                     raw,
                     allowed,
                     candidates,
@@ -1779,7 +1816,8 @@ async def _stream_answer(
         # streams but may return late objects in future tolerant-parse
         # modes. Apply the same hallucination filter + dedup gate.
         for raw in citation_extractor.finalize():
-            event = _build_progressive_citation_event(
+            event = await asyncio.to_thread(
+                _build_progressive_citation_event,
                 raw,
                 allowed,
                 candidates,
@@ -1810,9 +1848,12 @@ async def _stream_answer(
     if parsed is None:
         citations: list[dict[str, Any]] = []
     else:
-        citations = [
-            _to_citation_dict(c, candidates, contexts=contexts) for c in parsed.citations
-        ]
+        citations = await asyncio.to_thread(
+            lambda: [
+                _to_citation_dict(c, candidates, contexts=contexts)
+                for c in parsed.citations
+            ]
+        )
 
     yield AnswerEvent(kind="citations", data={"citations": citations})
     yield _empty_done_event(

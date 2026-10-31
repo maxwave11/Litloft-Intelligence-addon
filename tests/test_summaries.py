@@ -14,6 +14,7 @@ import pytest
 
 from tests.llm_helpers import resolved_with
 
+from app.text_utils import trim_to_sentence_boundary_with_offset
 from app.config import FeaturesConfig, LLMConfig, SummariesConfig
 from app.workers.summaries import (
     DETAILED_STATUS_FAILED,
@@ -36,6 +37,7 @@ from app.workers.summaries import (
     classify_missing_reason,
     generate_detailed_summary,
 )
+from tests.search_db_doubles import read_session_from  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +494,7 @@ class TestGetFullDocumentText:
     def test_concatenates_chunks_in_index_order(self, monkeypatch, mock_search_db):
         get_db, session = mock_search_db
         monkeypatch.setattr("app.workers.summaries.get_search_db", get_db)
+        monkeypatch.setattr('app.workers.summaries.get_search_db_read', read_session_from(get_db), raising=False)
 
         # Return rows in wrong order to verify ORDER BY CAST works.
         session.execute.return_value.fetchall.return_value = [
@@ -514,6 +517,7 @@ class TestGetFullDocumentText:
     def test_empty_when_no_rows(self, monkeypatch, mock_search_db):
         get_db, session = mock_search_db
         monkeypatch.setattr("app.workers.summaries.get_search_db", get_db)
+        monkeypatch.setattr('app.workers.summaries.get_search_db_read', read_session_from(get_db), raising=False)
 
         session.execute.return_value.fetchall.return_value = []
 
@@ -522,6 +526,7 @@ class TestGetFullDocumentText:
     def test_skips_empty_chunks(self, monkeypatch, mock_search_db):
         get_db, session = mock_search_db
         monkeypatch.setattr("app.workers.summaries.get_search_db", get_db)
+        monkeypatch.setattr('app.workers.summaries.get_search_db_read', read_session_from(get_db), raising=False)
 
         session.execute.return_value.fetchall.return_value = [
             ("real content",),
@@ -551,6 +556,7 @@ class TestGetPdfMarkdown:
     def test_returns_markdown_when_row_exists(self, monkeypatch, mock_search_db):
         get_db, session = mock_search_db
         monkeypatch.setattr("app.workers.summaries.get_search_db", get_db)
+        monkeypatch.setattr('app.workers.summaries.get_search_db_read', read_session_from(get_db), raising=False)
 
         session.execute.return_value.fetchone.return_value = ("# Heading\n\nBody",)
 
@@ -560,6 +566,7 @@ class TestGetPdfMarkdown:
     def test_returns_none_when_row_missing(self, monkeypatch, mock_search_db):
         get_db, session = mock_search_db
         monkeypatch.setattr("app.workers.summaries.get_search_db", get_db)
+        monkeypatch.setattr('app.workers.summaries.get_search_db_read', read_session_from(get_db), raising=False)
 
         session.execute.return_value.fetchone.return_value = None
 
@@ -568,6 +575,7 @@ class TestGetPdfMarkdown:
     def test_returns_none_when_markdown_empty(self, monkeypatch, mock_search_db):
         get_db, session = mock_search_db
         monkeypatch.setattr("app.workers.summaries.get_search_db", get_db)
+        monkeypatch.setattr('app.workers.summaries.get_search_db_read', read_session_from(get_db), raising=False)
 
         session.execute.return_value.fetchone.return_value = ("",)
 
@@ -2307,6 +2315,8 @@ class TestClassifyDetailedMissingReason:
             transcript="a" * 500,
         )
         assert classify_detailed_missing_reason("abc") == "not_generated"
+
+
 @pytest.mark.asyncio
 async def test_direct_summary_remains_pending_until_all_generations_finish(monkeypatch):
     import asyncio
@@ -2340,3 +2350,38 @@ async def test_direct_summary_remains_pending_until_all_generations_finish(monke
             gate.set()
         await asyncio.gather(first, second)
     assert 'concurrent' not in summaries.active_summary_generations
+
+
+class TestTrimToSentenceBoundaryWithOffset:
+    """SPEC-ADDON-038: the trim reports how much it removed from the front."""
+
+    @pytest.mark.parametrize(
+        ("snippet", "trimmed", "removed"),
+        [
+            # leading cut plus whitespace stripped after it
+            ("frag。  Whole one。tail", "Whole one。", 7),
+            # boundary at index 0 is a leading cut of 1
+            ("。Whole one。tail", "Whole one。", 1),
+            # no leading boundary: only the stripped trailing side changes
+            ("Whole one。tail", "Whole one。", 0),
+            # no boundary anywhere: leading whitespace is stripped
+            ("  no boundary  ", "no boundary", 2),
+            # first boundary past the midpoint: leading cut is skipped
+            ("A B C D E F G H I J。 tail", "A B C D E F G H I J。", 0),
+            # fallback branch: trimmed is empty, so snippet.strip() with leading whitespace
+            ("  \n  ", "", 5),
+            ("  \nabc", "abc", 3),
+            ("", "", 0),
+            # leading cut exactly at the midpoint is still taken
+            ("abc。efgh", "abc。efgh", 0),
+            # fallback: trailing whitespace is not counted as removed
+            ("。 x  ", "。 x", 0),
+        ],
+    )
+    def test_spec_addon_038_removed_counts_front_characters(
+        self, snippet, trimmed, removed
+    ):
+        result = trim_to_sentence_boundary_with_offset(snippet)
+        assert result == (trimmed, removed)
+        assert result[0] == _trim_to_sentence_boundary(snippet)
+        assert snippet[removed:].startswith(trimmed)

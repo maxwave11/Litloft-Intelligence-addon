@@ -281,6 +281,30 @@
         }
       },
       {
+        "path": "/search/exact",
+        "methods": [
+          "GET"
+        ],
+        "pre_check": {
+          "type": "addon_feature",
+          "feature": "search"
+        },
+        "response_filter": null,
+        "timeout": 30
+      },
+      {
+        "path": "/search/scenes",
+        "methods": [
+          "GET"
+        ],
+        "pre_check": {
+          "type": "addon_feature",
+          "feature": "search"
+        },
+        "response_filter": null,
+        "timeout": 30
+      },
+      {
         "path": "/search/compare",
         "methods": [
           "GET"
@@ -393,6 +417,18 @@
         "response_filter": null
       },
       {
+        "path": "/files/{file_id}/scenes",
+        "methods": [
+          "GET"
+        ],
+        "pre_check": {
+          "type": "file_access",
+          "param": "file_id"
+        },
+        "response_filter": null,
+        "timeout": 30
+      },
+      {
         "path": "/files/{file_id}/pdf-markdown",
         "methods": [
           "GET"
@@ -402,6 +438,18 @@
           "param": "file_id"
         },
         "response_filter": null
+      },
+      {
+        "path": "/files/{file_id}/document-text",
+        "methods": [
+          "GET"
+        ],
+        "pre_check": {
+          "type": "file_access",
+          "param": "file_id"
+        },
+        "response_filter": null,
+        "timeout": 25
       },
       {
         "path": "/files/{file_id}/frame",

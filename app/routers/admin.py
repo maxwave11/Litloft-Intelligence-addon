@@ -24,6 +24,7 @@ master-viewer judge.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -47,6 +48,7 @@ from app.transcription_overrides import (
     write_overrides,
 )
 from app.workers.transcription import build_inner_provider, get_provider
+from app.workers.transcription.haas_local import MODEL_REPO
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 # list rather than failing later inside ``get_provider``.
 ALL_PROVIDERS: tuple[str, ...] = (
     "whisper_local",
+    "haas_local",
     "openai_compatible",
     "deepgram",
     "elevenlabs_scribe",
@@ -68,6 +71,7 @@ ALL_PROVIDERS: tuple[str, ...] = (
 # means the provider does not need an env (whisper_local).
 _PROVIDER_API_KEY_ENV: dict[str, str | None] = {
     "whisper_local": None,
+    "haas_local": None,
     "openai_compatible": "OPENAI_API_KEY",
     "deepgram": "DEEPGRAM_API_KEY",
     "elevenlabs_scribe": "ELEVENLABS_API_KEY",
@@ -265,8 +269,12 @@ def _frozen_subconfig_summary() -> dict[str, Any]:
     """
     base = config.settings.transcription
     return {
+        # The worker loads models.whisper; whisper_local.model is parsed but unused.
         "whisper_local": {
-            "model": base.whisper_local.model,
+            "models.whisper": config.settings.models.whisper,
+        },
+        "haas_local": {
+            "model": MODEL_REPO,
         },
         "openai_compatible": {
             "model": base.openai_compatible.model,
@@ -892,7 +900,7 @@ async def get_embedding_config() -> dict[str, Any]:
     Spec §3.4. Reads the on-disk override authoritatively so a
     freshly-saved value is reflected before the next restart.
     """
-    return _embedding_status_payload()
+    return await asyncio.to_thread(_embedding_status_payload)
 
 
 @router.put("/embedding")
@@ -914,7 +922,7 @@ async def update_embedding_config(payload: EmbeddingUpdate) -> dict[str, Any]:
         payload.text_embedding, path,
     )
     notify_status = await _notify_core_restart_pending()
-    body = _embedding_status_payload()
+    body = await asyncio.to_thread(_embedding_status_payload)
     body.update({
         "status": "saved",
         "restart_required": True,
@@ -940,7 +948,7 @@ async def reset_embedding_config() -> dict[str, Any]:
             "Embedding overrides reset requested but no file present"
         )
     notify_status = await _notify_core_restart_pending()
-    body = _embedding_status_payload()
+    body = await asyncio.to_thread(_embedding_status_payload)
     body.update({
         "status": "reset",
         "removed": removed,
@@ -1095,13 +1103,16 @@ async def get_failed_jobs(
     # so the handler stays callable from tests that bypass the proxy.
     limit = max(1, min(limit, _FAILED_JOBS_MAX_LIMIT))
     offset = max(0, offset)
+    return await asyncio.to_thread(_failed_jobs_page, limit, offset)
 
+
+def _failed_jobs_page(limit: int, offset: int) -> FailedJobsResponse:
     import app.database as database_mod
     from sqlalchemy import and_, func, or_
 
     from app.models import IndexedFile, JobRecord
 
-    with database_mod.get_search_db() as session:
+    with database_mod.get_search_db_read() as session:
         # Step 1: distinct groups (file_id, job_kind, provider) ordered
         # by their latest attempted_at. The aggregate considers every
         # status, then the outer query keeps only groups whose latest
@@ -1288,34 +1299,37 @@ async def resolve_failed_job(
 
     now = datetime.now(UTC)
 
-    with database_mod.get_search_db() as session:
-        row = (
-            session.query(IndexedFile)
-            .filter(
-                IndexedFile.file_id == file_id,
-                IndexedFile.active.is_(True),
+    def _mark_resolved() -> None:
+        with database_mod.get_search_db() as session:
+            row = (
+                session.query(IndexedFile)
+                .filter(
+                    IndexedFile.file_id == file_id,
+                    IndexedFile.active.is_(True),
+                )
+                .first()
             )
-            .first()
-        )
-        if row is None:
-            raise HTTPException(status_code=404, detail="File not indexed")
+            if row is None:
+                raise HTTPException(status_code=404, detail="File not indexed")
 
-        setattr(row, flag_column, True)
-        if task == "clip":
-            row.clip_thumbnail_indexed = True
-        elif task == "whisper":
-            row.tfidf_keywords_indexed = True
+            setattr(row, flag_column, True)
+            if task == "clip":
+                row.clip_thumbnail_indexed = True
+            elif task == "whisper":
+                row.tfidf_keywords_indexed = True
 
-        session.add(JobRecord(
-            file_id=file_id,
-            job_kind=job_kind,
-            provider=provider,
-            status="skipped",
-            error_class="ManuallyResolved",
-            error_message="Marked resolved from the admin failed jobs modal",
-            attempted_at=now,
-            completed_at=now,
-        ))
+            session.add(JobRecord(
+                file_id=file_id,
+                job_kind=job_kind,
+                provider=provider,
+                status="skipped",
+                error_class="ManuallyResolved",
+                error_message="Marked resolved from the admin failed jobs modal",
+                attempted_at=now,
+                completed_at=now,
+            ))
+
+    await asyncio.to_thread(_mark_resolved)
 
     return ResolveFailedJobResponse(
         status="resolved",

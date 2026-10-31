@@ -11,6 +11,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import text as sql_text
@@ -21,12 +22,16 @@ from app.database import (
     delete_fts_text_content,
     delete_fts_transcripts,
     get_litloft_db,
+    get_search_engine,
     get_search_db,
     get_search_db_read,
     upsert_fts_file,
     validate_vector_table,
 )
+from app.idf_backfill import mark_idf_terms_stale, request_idf_backfill
 from app.models import Embedding, IndexedFile, TranscriptChunk, TranscriptWord
+from app.sidecar_match import match_siblings
+from app.vec_partition import repair_unkeyed_rows
 from app.workers.blip import check_idle_unload as check_blip_idle_unload
 from app.workers.clip_concepts import check_idle_unload as check_clip_concepts_idle_unload
 from app.workers.clip import (
@@ -38,6 +43,9 @@ from app.workers.clip import (
     VIDEO_TYPES,
 )
 from app.workers.metadata import index_metadata_batch, index_text_content
+from app.workers.transcription.haas_local import (
+    check_idle_unload as check_haas_idle_unload,
+)
 from app.workers.whisper import (
     check_idle_unload as check_whisper_idle_unload,
     index_tfidf_keywords_backfill,
@@ -47,6 +55,9 @@ from app.workers.whisper import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Under SQLite's bound-parameter limit, so an IN list never overflows it.
+_RESET_BATCH_SIZE = 500
 
 # MIME types for text content extraction (shared across all indexing logic)
 TEXT_MIMES = frozenset({
@@ -111,6 +122,28 @@ class IndexStatus:
     pending_whisper: int = 0
     pending_text: int = 0
     pending_tfidf_keywords: int = 0
+
+
+def _loft_needs_reset(file_path: str, chunked: bool) -> bool | None:
+    """Whether an indexed loft must be transcribed again; None if unlistable.
+
+    Temp STT audio is an explicit request from Media Import and must re-run
+    even when the loft already has VTT chunks.
+    """
+    loft_path = Path(file_path)
+    stem = loft_path.stem
+    parent = loft_path.parent
+    try:
+        if (parent / f"{stem}.stt_temp.m4a").is_file():
+            return True
+    except OSError:
+        return None
+    if chunked:
+        return False
+    try:
+        return bool(match_siblings(parent, stem, "*.vtt"))
+    except OSError:
+        return None
 
 
 class IndexManager:
@@ -203,9 +236,6 @@ class IndexManager:
             ),
         ]
 
-        # Initial reconciliation
-        await self.reconcile()
-
     async def stop(self) -> None:
         """Stop all background workers gracefully."""
         logger.info("Stopping index manager")
@@ -219,6 +249,10 @@ class IndexManager:
         self._state = QueueState.PAUSED
         self._pause_event.clear()
         logger.info("Queue paused")
+
+    def is_paused(self) -> bool:
+        """Whether the queue is paused. Safe to read from any thread."""
+        return not self._pause_event.is_set()
 
     def resume(self) -> None:
         """Resume queue processing."""
@@ -251,7 +285,7 @@ class IndexManager:
 
     def get_index_status(self) -> IndexStatus:
         """Get overall indexing status from the database."""
-        with get_search_db() as session:
+        with get_search_db_read() as session:
             active_files = session.query(IndexedFile).filter(
                 IndexedFile.active.is_(True)
             )
@@ -479,6 +513,8 @@ class IndexManager:
 
         except Exception as e:
             logger.error("Reconciliation failed: %s", e)
+        finally:
+            request_idf_backfill()
 
         return {
             "added": added,
@@ -595,50 +631,70 @@ class IndexManager:
         indexed; that temp audio intentionally wins even if VTT chunks
         already exist (manual/always STT).
         """
-        with get_search_db() as session:
-            loft_refs = (
-                session.query(IndexedFile)
-                .filter(
-                    IndexedFile.active.is_(True),
-                    IndexedFile.mime_type == LOFT_MIME,
-                    IndexedFile.whisper_indexed.is_(True),
-                )
-                .all()
+        def _loft_refs(session, file_ids: list[str] | None = None) -> list:
+            has_chunks = (
+                session.query(TranscriptChunk.file_id)
+                .filter(TranscriptChunk.file_id == IndexedFile.file_id)
+                .exists()
+            )
+            query = session.query(
+                IndexedFile.file_id, IndexedFile.file_path, has_chunks
+            ).filter(
+                IndexedFile.active.is_(True),
+                IndexedFile.mime_type == LOFT_MIME,
+                IndexedFile.whisper_indexed.is_(True),
+            )
+            if file_ids is not None:
+                query = query.filter(IndexedFile.file_id.in_(file_ids))
+            return query.all()
+
+        with get_search_db_read() as session:
+            loft_refs = _loft_refs(session)
+
+        # Listing every loft folder takes minutes on a large library behind
+        # a slow bind mount, so it runs without the write lock and only
+        # narrows the candidates.
+        candidates: list[str] = []
+        unlistable_count = 0
+        for file_id, file_path, chunked in loft_refs:
+            needs_reset = _loft_needs_reset(file_path, chunked)
+            if needs_reset is None:
+                unlistable_count += 1
+            elif needs_reset:
+                candidates.append(file_id)
+
+        if unlistable_count:
+            logger.warning(
+                "Skipped %d loft ref(s) whose folder could not be listed",
+                unlistable_count,
             )
 
-            reset_count = 0
-            for f in loft_refs:
-                # Temp STT audio is an explicit request from Media Import
-                # and must re-run even when the loft already has VTT chunks.
-                from pathlib import Path
-                loft_path = Path(f.file_path)
-                stem = loft_path.stem
-                parent = loft_path.parent
-                temp_audio = parent / f"{stem}.stt_temp.m4a"
-                if temp_audio.is_file():
-                    f.whisper_indexed = False
-                    reset_count += 1
-                    continue
+        # A whisper job can finish between the scan and the write, so each
+        # candidate is decided again under the lock the job writes with.
+        reset_count = 0
+        for i in range(0, len(candidates), _RESET_BATCH_SIZE):
+            batch = candidates[i:i + _RESET_BATCH_SIZE]
+            with get_search_db() as session:
+                confirmed = [
+                    file_id
+                    for file_id, file_path, chunked in _loft_refs(session, batch)
+                    if _loft_needs_reset(file_path, chunked)
+                ]
+                if confirmed:
+                    reset_count += (
+                        session.query(IndexedFile)
+                        .filter(IndexedFile.file_id.in_(confirmed))
+                        .update(
+                            {IndexedFile.whisper_indexed: False},
+                            synchronize_session=False,
+                        )
+                    )
 
-                has_chunks = (
-                    session.query(TranscriptChunk)
-                    .filter_by(file_id=f.file_id)
-                    .first()
-                    is not None
-                )
-                if has_chunks:
-                    continue
-
-                # Check if VTT file now exists on disk
-                if any(parent.glob(f"{stem}*.vtt")):
-                    f.whisper_indexed = False
-                    reset_count += 1
-
-            if reset_count:
-                logger.info(
-                    "Reset %d loft ref(s) with new VTT/STT temp for re-indexing",
-                    reset_count,
-                )
+        if reset_count:
+            logger.info(
+                "Reset %d loft ref(s) with new VTT/STT temp for re-indexing",
+                reset_count,
+            )
 
     async def _resume_incomplete(self) -> int:
         """Re-queue active files that have incomplete indexing.
@@ -1197,6 +1253,8 @@ class IndexManager:
                         continue
 
                     title = meta.get("title") or ""
+                    if indexed.filename != meta["filename"]:
+                        mark_idf_terms_stale(session, file_id)
                     indexed.drive = meta["drive"]
                     indexed.file_path = abs_path
                     indexed.filename = meta["filename"]
@@ -1558,13 +1616,13 @@ class IndexManager:
                 await asyncio.sleep(5)
 
     async def _reconciliation_worker(self) -> None:
-        """Periodically reconcile index with Litloft DB."""
+        """Reconcile index with Litloft DB now, then periodically."""
         interval = settings.indexing.reconciliation_interval
 
         while True:
             try:
-                await asyncio.sleep(interval)
                 await self.reconcile()
+                await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -1584,6 +1642,7 @@ class IndexManager:
                 check_whisper_idle_unload()
                 check_blip_idle_unload()
                 check_clip_concepts_idle_unload()
+                check_haas_idle_unload()
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -1865,6 +1924,11 @@ def cleanup_orphaned_embeddings() -> int:
 
 
 # --- Helper functions for Litloft DB interaction ---
+
+
+def repair_unkeyed_vec_rows() -> dict[str, int]:
+    """Re-key vec rows stored without a partition value. Called once at startup."""
+    return repair_unkeyed_rows(get_search_engine())
 
 
 def _get_litloft_files_by_ids(file_ids: list[str]) -> dict[str, dict]:

@@ -21,7 +21,7 @@ from __future__ import annotations
 import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -46,11 +46,14 @@ from sqlalchemy.orm import sessionmaker  # noqa: E402
 from app.config import FeaturesConfig  # noqa: E402
 from app.database import Base, _create_file_summaries_table  # noqa: E402
 from app.routers.summaries import (  # noqa: E402
+    batch_summaries,
     edit_summary,
     get_summary,
+    regenerate_summary,
     revert_summary,
 )
-from app.schemas import SummaryEditRequest  # noqa: E402
+from app.schemas import BatchSummariesRequest, SummaryEditRequest  # noqa: E402
+from tests.search_db_doubles import read_session_from  # noqa: E402
 
 
 @pytest.fixture()
@@ -132,7 +135,9 @@ def search_db(tmp_path, monkeypatch):
     # The router reads get_search_db from the module-level import, so we
     # patch both the database module's binding and the router's alias.
     monkeypatch.setattr("app.database.get_search_db", _get_search_db)
+    monkeypatch.setattr('app.database.get_search_db_read', read_session_from(_get_search_db), raising=False)
     monkeypatch.setattr("app.routers.summaries.get_search_db", _get_search_db)
+    monkeypatch.setattr('app.routers.summaries.get_search_db_read', read_session_from(_get_search_db), raising=False)
     return engine, Session
 
 
@@ -208,6 +213,121 @@ class TestGetSummaryNewFields:
         assert result.edited_at is not None
 
 
+def _mark_detailed_only(engine, *, short: str) -> None:
+    """Leave the seeded row holding a detailed summary and the given short text."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE file_summaries SET short_summary = :s, long_summary = '', "
+                "status = 'hidden', detailed_status = 'generated' "
+                "WHERE file_id = 'abc123'"
+            ),
+            {"s": short},
+        )
+
+
+class TestRowWithoutShortSummary:
+    """A row holding only a detailed summary has no short summary."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("short", "available"), [("", False), ("AI short", True)]
+    )
+    async def test_get_reports_short_summary_by_its_text(
+        self, search_db, feature_manual, monkeypatch, short, available
+    ):
+        engine, _ = search_db
+        monkeypatch.setattr(
+            "app.routers.summaries.classify_missing_reason",
+            lambda _fid: "not_generated",
+        )
+        _mark_detailed_only(engine, short=short)
+        result = await get_summary("abc123", "drive1")
+        assert result.available is available
+        if not available:
+            assert result.reason == "not_generated"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("short", "queued"), [("", 1), ("AI short", 0)]
+    )
+    async def test_batch_queues_files_without_short_summary(
+        self, search_db, feature_manual, monkeypatch, short, queued
+    ):
+        engine, _ = search_db
+        _mark_detailed_only(engine, short=short)
+        worker = MagicMock()
+        worker.enqueue = AsyncMock()
+        monkeypatch.setattr(
+            "app.routers.summaries.get_summaries_worker", lambda: worker
+        )
+        monkeypatch.setattr(
+            "app.routers.summaries.require_llm", AsyncMock()
+        )
+        result = await batch_summaries(
+            BatchSummariesRequest(file_ids=["abc123"]), "drive1"
+        )
+        assert result.queued == queued
+        assert worker.enqueue.await_count == queued
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("short", "long", "detailed_status", "expected"),
+        [
+            ("", "", "generated", ("", "", "hidden", None, None, None, "generated")),
+            (
+                "AI short",
+                "AI long",
+                "generated",
+                ("", "", "hidden", None, None, None, "generated"),
+            ),
+            ("AI short", "AI long", None, None),
+        ],
+        ids=["detailed-only", "short-and-detailed", "no-detailed"],
+    )
+    async def test_regenerate_clears_short_text_and_keeps_detailed_state(
+        self, search_db, feature_manual, monkeypatch,
+        short, long, detailed_status, expected,
+    ):
+        engine, _ = search_db
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE file_summaries SET short_summary = :s, "
+                    "long_summary = :l, status = 'generated', "
+                    "detailed_status = :d, edited_at = 'x', "
+                    "short_original = 'os', long_original = 'ol' "
+                    "WHERE file_id = 'abc123'"
+                ),
+                {"s": short, "l": long, "d": detailed_status},
+            )
+        worker = MagicMock()
+        worker.enqueue = AsyncMock()
+        monkeypatch.setattr(
+            "app.routers.summaries.get_summaries_worker", lambda: worker
+        )
+        monkeypatch.setattr("app.routers.summaries.require_llm", AsyncMock())
+        monkeypatch.setattr(
+            "app.routers.summaries._reembed_metadata_after_summary_change",
+            AsyncMock(),
+        )
+        monkeypatch.setattr(
+            "app.routers.summaries.classify_missing_reason",
+            lambda _fid: "not_generated",
+        )
+        await regenerate_summary("abc123", drive="drive1", body=None)
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT short_summary, long_summary, status, edited_at, "
+                    "short_original, long_original, detailed_status "
+                    "FROM file_summaries WHERE file_id = 'abc123'"
+                )
+            ).fetchone()
+        assert (tuple(row) if row else None) == expected
+        worker.enqueue.assert_awaited_once_with("abc123")
+
+
 class TestEditSummary:
     """First edit snapshots the AI output; subsequent edits preserve it."""
 
@@ -227,6 +347,21 @@ class TestEditSummary:
         assert row["short_original"] == "AI short"
         assert row["long_original"] == "AI long content"
         assert row["edited_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_edit_from_another_drive_is_404_and_writes_nothing(
+        self, search_db,
+    ):
+        engine, _ = search_db
+        body = SummaryEditRequest(short_summary="x", long_summary="y")
+
+        with pytest.raises(HTTPException) as exc:
+            await edit_summary("abc123", body, "drive2")
+
+        assert exc.value.status_code == 404
+        row = _row(engine, "abc123")
+        assert row["short_summary"] == "AI short"
+        assert row["edited_at"] is None
 
     @pytest.mark.asyncio
     async def test_second_edit_preserves_ai_snapshot(self, search_db):

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from sqlalchemy import text as sql_text
 
-from app.database import get_search_db, get_search_engine
+from app.database import get_search_db_read, get_search_engine
 from app.search import _l2_to_cosine_similarity
 from app.workers.embedder import embed_query
 
@@ -29,13 +29,16 @@ class ShortlistResult:
     shortlist is empty so callers can compare against
     ``coarse_score_threshold`` without special-casing emptiness.
     ``drive_file_count`` is the active-file count for the drive,
-    used by the small-drive bypass.
+    used by the small-drive bypass. ``exact_match_file_ids`` holds the
+    files added by the rare-keyword lookup; they carry no score and are
+    not part of ``file_ids``.
     """
 
     file_ids: tuple[str, ...]
     scores: tuple[float, ...]
     top_score: float
     drive_file_count: int
+    exact_match_file_ids: tuple[str, ...] = ()
 
 
 async def coarse_retrieve(
@@ -64,61 +67,54 @@ async def coarse_retrieve(
     query_vector = await asyncio.to_thread(embed_query, query)
     vec_bytes = query_vector.tobytes()
 
-    # sqlite-vec MATCH returns the GLOBAL top-K nearest neighbors across
-    # the entire vec_text table. When multiple drives × multiple
-    # embedding types (transcript / text_content / blip_caption /
-    # metadata) share the table, a naive ``LIMIT :top_k`` followed by
-    # post-WHERE filters can yield zero target-drive metadata rows even
-    # when the drive's metadata channel has plenty of strong matches —
-    # the global neighborhood is dominated by other drives / channels.
-    #
-    # Mitigation: over-fetch by a wide constant so the post-filter has
-    # a generous candidate pool. The pattern mirrors the per-file
-    # similar-files code path in ``app/search.py`` (~line 1640) which
-    # over-fetches by ``source_count + limit + 20``. Here we use a
-    # multiplicative bump because the post-filter is more aggressive
-    # (drives × types vs. just type).
+    # The KNN reads only the ``metadata`` partition but spans every drive,
+    # so other drives' summaries can fill a ``LIMIT :top_k`` before the
+    # drive filter runs. Over-fetch so the filter has a generous pool.
     over_fetch = max(top_k * 50, 500)
 
-    engine = get_search_engine()
-    with engine.connect() as conn:
-        # sqlite-vec rejects ``ORDER BY ... LIMIT`` on the outer SELECT
-        # when JOINs sit between the MATCH and the LIMIT — the LIMIT
-        # cannot be pushed into the vec0 KNN scan, and vec0 fails with
-        # "A LIMIT or 'k = ?' constraint is required on vec0 knn
-        # queries". Isolate the KNN scan in a CTE so the limit binds
-        # directly to vec_text, then JOIN the post-filter on the
-        # over-fetched id set.
-        rows = conn.execute(
-            sql_text(
-                "WITH knn AS ("
-                "  SELECT embedding_id, distance "
-                "  FROM vec_text "
-                "  WHERE vector MATCH :vec "
-                "  ORDER BY distance "
-                "  LIMIT :over_fetch"
-                ") "
-                "SELECT i.file_id, knn.distance "
-                "FROM knn "
-                "JOIN embeddings e ON e.id = knn.embedding_id "
-                "JOIN indexed_files i ON i.file_id = e.file_id "
-                "WHERE e.embedding_type = 'metadata' "
-                "  AND i.drive = :drive "
-                "  AND i.active = 1 "
-                "ORDER BY knn.distance"
-            ),
-            {"vec": vec_bytes, "drive": drive, "over_fetch": over_fetch},
-        ).fetchall()
+    def _query() -> tuple[list, int]:
+        engine = get_search_engine()
+        with engine.connect() as conn:
+            # sqlite-vec rejects ``ORDER BY ... LIMIT`` on the outer SELECT
+            # when JOINs sit between the MATCH and the LIMIT — the LIMIT
+            # cannot be pushed into the vec0 KNN scan, and vec0 fails with
+            # "A LIMIT or 'k = ?' constraint is required on vec0 knn
+            # queries". Isolate the KNN scan in a CTE so the limit binds
+            # directly to vec_text, then JOIN the post-filter on the
+            # over-fetched id set.
+            rows = conn.execute(
+                sql_text(
+                    "WITH knn AS ("
+                    "  SELECT embedding_id, distance "
+                    "  FROM vec_text "
+                    "  WHERE vector MATCH :vec AND k = :over_fetch "
+                    "  AND embedding_type = 'metadata' "
+                    "  ORDER BY distance"
+                    ") "
+                    "SELECT i.file_id, knn.distance "
+                    "FROM knn "
+                    "JOIN embeddings e ON e.id = knn.embedding_id "
+                    "JOIN indexed_files i ON i.file_id = e.file_id "
+                    "WHERE e.embedding_type = 'metadata' "
+                    "  AND i.drive = :drive "
+                    "  AND i.active = 1 "
+                    "ORDER BY knn.distance"
+                ),
+                {"vec": vec_bytes, "drive": drive, "over_fetch": over_fetch},
+            ).fetchall()
 
-    with get_search_db() as session:
-        count_row = session.execute(
-            sql_text(
-                "SELECT COUNT(*) FROM indexed_files "
-                "WHERE drive = :drive AND active = 1"
-            ),
-            {"drive": drive},
-        ).fetchone()
-        drive_file_count = int(count_row[0]) if count_row else 0
+        with get_search_db_read() as session:
+            count_row = session.execute(
+                sql_text(
+                    "SELECT COUNT(*) FROM indexed_files "
+                    "WHERE drive = :drive AND active = 1"
+                ),
+                {"drive": drive},
+            ).fetchone()
+            drive_file_count = int(count_row[0]) if count_row else 0
+        return rows, drive_file_count
+
+    rows, drive_file_count = await asyncio.to_thread(_query)
 
     if not rows:
         return ShortlistResult(

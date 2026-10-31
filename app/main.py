@@ -6,6 +6,7 @@ on application startup.
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import logging
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
@@ -22,12 +23,15 @@ from app.routers import (
     admin,
     analysis_prompt,
     chapter_suggestions,
+    document_text,
+    exact_search,
     files,
     llm_choices,
     pickup,
     queue,
     rag,
     refine,
+    scenes,
     search,
     similar,
     summaries,
@@ -64,6 +68,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     watchdog = LoopWatchdog(asyncio.get_running_loop())
     watchdog.start()
 
+    # Worker threads parked on the search-DB write lock hold their slot
+    # in the default executor until the writer finishes. The stock size,
+    # min(32, cpu + 4), is about the number of workers, so reads that
+    # take no lock would queue behind them.
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=64, thread_name_prefix="offload")
+    )
+
     # The webhook gate fails closed once configured, and it needs the other
     # end to agree: core only sends X-Webhook-Secret when the listener in
     # event-hooks.json declares secret_env. If the secret is set here but
@@ -84,7 +96,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
 
     # Initialize databases
-    init_search_db()
+    # Off the loop thread: the first start after an upgrade can spend minutes
+    # migrating the vector tables, which the loop watchdog would report as a hang.
+    await asyncio.to_thread(init_search_db)
     logger.info("Search database initialized")
 
     try:
@@ -100,21 +114,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Clean up orphaned data from potential crash during previous run
     from app.indexer import (
         cleanup_orphaned_embeddings,
+        repair_unkeyed_vec_rows,
         reset_falsely_completed_clip,
         reset_falsely_completed_clip_thumbnail,
     )
-    cleaned = cleanup_orphaned_embeddings()
+    cleaned = await asyncio.to_thread(cleanup_orphaned_embeddings)
     if cleaned > 0:
         logger.info("Cleaned up %d orphaned embeddings from previous run", cleaned)
 
+    try:
+        await asyncio.to_thread(repair_unkeyed_vec_rows)
+    except Exception:
+        logger.exception("Failed to repair unkeyed vector rows; continuing startup")
+
     # Reset files marked as clip_indexed but missing actual vectors
-    reset = reset_falsely_completed_clip()
+    reset = await asyncio.to_thread(reset_falsely_completed_clip)
     if reset > 0:
         logger.info("Reset %d falsely completed CLIP files for re-indexing", reset)
 
     # The thumbnail leg is tracked separately and a video's scene rows
     # hide its absence from the check above.
-    reset_thumb = reset_falsely_completed_clip_thumbnail()
+    reset_thumb = await asyncio.to_thread(reset_falsely_completed_clip_thumbnail)
     if reset_thumb:
         logger.info(
             "Reopened %d thumbnail CLIP legs for re-indexing",
@@ -128,7 +148,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # restart return to a resumable state (design doc §9).
     try:
         from app.workers.video_visual import recover_on_startup as recover_video_visual
-        recover_video_visual()
+        await asyncio.to_thread(recover_video_visual)
     except Exception:
         logger.exception("video_visual startup recovery failed; continuing startup")
 
@@ -140,7 +160,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # words the dead worker wrote.
     try:
         from app.workers.whisper import fail_orphaned_running_jobs
-        fail_orphaned_running_jobs()
+        await asyncio.to_thread(fail_orphaned_running_jobs)
     except Exception:
         logger.exception(
             "Failed to fail orphaned running JobRecords; continuing startup"
@@ -363,10 +383,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.error("Failed to start index manager: %s", e)
 
+    from app.database import check_idf_term_rules
+    from app.idf_backfill import idf_backfill_loop
+
+    await asyncio.to_thread(check_idf_term_rules)
+    idf_backfill_task = asyncio.create_task(
+        idf_backfill_loop(), name="idf_backfill"
+    )
+
     logger.info("Semantic search service ready on port %d", settings.port)
     yield
 
     # Shutdown
+    idf_backfill_task.cancel()
+    try:
+        await idf_backfill_task
+    except asyncio.CancelledError:
+        pass
     pickup_task.cancel()
     try:
         await pickup_task
@@ -435,6 +468,9 @@ app.include_router(llm_choices.router)
 app.include_router(refine.router)
 app.include_router(vision.router)
 app.include_router(video_visual.router)
+app.include_router(scenes.router)
+app.include_router(exact_search.router)
+app.include_router(document_text.router)
 app.include_router(admin.router)
 app.include_router(analysis_prompt.router)
 
@@ -505,10 +541,10 @@ def status_endpoint() -> StatusResponse:
     }
     filenames: dict[str, str] = {}
     if all_active_ids:
-        from app.database import get_search_db
+        from app.database import get_search_db_read
         from app.models import IndexedFile
 
-        with get_search_db() as session:
+        with get_search_db_read() as session:
             rows = (
                 session.query(IndexedFile.file_id, IndexedFile.filename)
                 .filter(IndexedFile.file_id.in_(all_active_ids))

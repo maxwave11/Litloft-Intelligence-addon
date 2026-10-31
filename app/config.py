@@ -213,6 +213,14 @@ class GeminiProviderConfig:
 
 
 @dataclass(frozen=True)
+class HaasLocalProviderConfig:
+    """On-host Japanese transcription via sherpa-onnx (``haas_local``)."""
+
+    num_threads: int = 4
+    max_segment_seconds: int = 45
+
+
+@dataclass(frozen=True)
 class TranscriptionConfig:
     """Top-level transcription settings.
 
@@ -227,6 +235,9 @@ class TranscriptionConfig:
     language_hint: str = ""
     hotwords: tuple[str, ...] = ()
     whisper_local: WhisperLocalConfig = field(default_factory=WhisperLocalConfig)
+    haas_local: HaasLocalProviderConfig = field(
+        default_factory=HaasLocalProviderConfig
+    )
     openai_compatible: OpenAICompatibleProviderConfig = field(
         default_factory=OpenAICompatibleProviderConfig
     )
@@ -351,6 +362,9 @@ class HierarchicalRagConfig:
     # Reserved for Phase 3 (multi-query clue generation). Unused in
     # Phases 1 / 2.
     clue_count: int = 3
+    # A keyword token that appears in at most this many files of the drive
+    # adds those files to the shortlist. 0 turns the step off.
+    exact_match_max_files: int = 10
 
 
 @dataclass(frozen=True)
@@ -745,6 +759,76 @@ def _parse_nested(data: dict[str, Any], key: str, cls: type) -> Any:
 
 _RAG_NESTED_KEYS = ("hierarchical", "personal_history", "category_expansion")
 
+_EXACT_MATCH_MAX_FILES_DEFAULT = HierarchicalRagConfig().exact_match_max_files
+
+
+def _checked_hierarchical(section: dict[str, Any]) -> dict[str, Any]:
+    """Return ``section`` with ``exact_match_max_files`` made valid.
+
+    Absent or null falls back to the default silently; any other value
+    that is not an integer >= 0 (``bool`` is an ``int`` subclass, so it is
+    excluded explicitly) logs one warning and falls back as well.
+    """
+    raw = section.get("hierarchical")
+    if not isinstance(raw, dict) or "exact_match_max_files" not in raw:
+        return section
+    value = raw["exact_match_max_files"]
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+    ):
+        logger.warning(
+            "rag.hierarchical.exact_match_max_files must be an integer >= 0, "
+            "got %r; using %d",
+            value, _EXACT_MATCH_MAX_FILES_DEFAULT,
+        )
+        value = None
+    if value is not None:
+        return section
+    cleaned = {k: v for k, v in raw.items() if k != "exact_match_max_files"}
+    return {**section, "hierarchical": cleaned}
+
+
+_HAAS_LOCAL_RANGES = {
+    "num_threads": (1, None),
+    "max_segment_seconds": (15, 120),
+}
+
+
+def _parse_haas_local(section: dict[str, Any]) -> HaasLocalProviderConfig:
+    """Build the ``haas_local`` config, replacing out-of-range values.
+
+    Absent or null falls back to the default silently; any other value
+    that is not an integer in range (``bool`` is an ``int`` subclass, so
+    it is excluded explicitly) logs one warning and falls back as well.
+    """
+    raw = section.get("haas_local")
+    raw = raw if isinstance(raw, dict) else {}
+    defaults = HaasLocalProviderConfig()
+    values: dict[str, int] = {}
+    for key, (low, high) in _HAAS_LOCAL_RANGES.items():
+        default = getattr(defaults, key)
+        value = raw.get(key)
+        if value is None:
+            values[key] = default
+        elif (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < low
+            or (high is not None and value > high)
+        ):
+            logger.warning(
+                "transcription.haas_local.%s must be an integer %s, got %r; "
+                "using %d",
+                key,
+                f">= {low}" if high is None else f"from {low} to {high}",
+                value,
+                default,
+            )
+            values[key] = default
+        else:
+            values[key] = value
+    return HaasLocalProviderConfig(**values)
+
 
 def _parse_rag(
     data: dict[str, Any],
@@ -770,6 +854,8 @@ def _parse_rag(
         from app.rag_overrides import merge_into_rag_dict
 
         section = merge_into_rag_dict(section, overrides)
+
+    section = _checked_hierarchical(section)
 
     flat_kwargs = {
         k: v
@@ -887,6 +973,7 @@ def _parse_transcription(data: dict[str, Any]) -> TranscriptionConfig:
         language_hint=language_hint_value,
         hotwords=hotwords_value,
         whisper_local=whisper_local,
+        haas_local=_parse_haas_local(new_section),
         openai_compatible=_parse_nested(
             new_section, "openai_compatible", OpenAICompatibleProviderConfig
         ),

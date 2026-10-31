@@ -325,6 +325,84 @@ class VideoVisualIndexResponse(BaseModel):
     stale: bool = False
 
 
+class VideoScenesWindow(BaseModel):
+    start: float
+    end: float | None
+
+
+class VideoSceneItem(BaseModel):
+    start: float
+    end: float | None
+    transcript_excerpt: str | None
+
+
+class VideoScenesResponse(BaseModel):
+    file_id: str
+    duration: float | None
+    window: VideoScenesWindow | None
+    candidate_count: int
+    scenes: list[VideoSceneItem]
+
+
+class ExactSearchSegment(BaseModel):
+    file_id: str
+    filename: str
+    source: Literal["text", "transcript", "scene"]
+    chunk_index: int | None
+    page: int | None
+    section: int | None
+    section_title: str | None
+    start_time: float | None
+    end_time: float | None
+    field: Literal["scene_label", "visible_text"] | None
+    match_count: int
+    snippet: str
+
+
+class ExactSearchResponse(BaseModel):
+    query: str
+    sources: list[str]
+    total: int
+    offset: int
+    segments: list[ExactSearchSegment]
+
+
+class SceneSearchResult(BaseModel):
+    file_id: str
+    filename: str
+    start_time: float
+    end_time: float | None
+    scene_label: str | None
+    visible_text: str | None
+    score: float
+
+
+class SceneSearchResponse(BaseModel):
+    query: str
+    results: list[SceneSearchResult]
+
+
+class DocumentTextUnit(BaseModel):
+    number: int
+    title: str | None
+    text: str
+    truncated: bool
+    extractor: str
+
+
+class DocumentTextCursor(BaseModel):
+    start: int
+    offset: int
+
+
+class DocumentTextResponse(BaseModel):
+    file_id: str
+    unit: str
+    unit_count: int
+    units: list[DocumentTextUnit]
+    next: DocumentTextCursor | None
+
+
 # --- Summaries ---
 
 

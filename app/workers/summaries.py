@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from sqlalchemy import text as sql_text
 
 from app.config import settings
-from app.database import get_search_db
+from app.database import get_search_db, get_search_db_read
 from app import llm_routing
 from app.llm_routing import Resolved
 from app.models import IndexedFile, TranscriptChunk, generate_insight_id
@@ -402,7 +402,7 @@ def classify_missing_reason(file_id: str) -> str:
 
 def _get_indexed_file(file_id: str) -> dict | None:
     """Fetch basic indexed-file info for a file, or None if not indexed."""
-    with get_search_db() as session:
+    with get_search_db_read() as session:
         f = (
             session.query(IndexedFile)
             .filter(
@@ -426,7 +426,7 @@ def _get_indexed_file(file_id: str) -> dict | None:
 
 def _get_full_transcript(file_id: str) -> str:
     """Load the entire Whisper transcript for a file as one string."""
-    with get_search_db() as session:
+    with get_search_db_read() as session:
         chunks = (
             session.query(TranscriptChunk)
             .filter(TranscriptChunk.file_id == file_id)
@@ -447,7 +447,7 @@ def _get_full_document_text(file_id: str) -> str:
     chunk text written during indexing. Chunks are concatenated in
     numeric chunk_index order.
     """
-    with get_search_db() as session:
+    with get_search_db_read() as session:
         # chunk_index is stored as a string in the FTS5 table, so we cast
         # to INTEGER for correct ordering (otherwise "10" sorts before "2").
         rows = session.execute(
@@ -470,7 +470,7 @@ def _get_pdf_markdown(file_id: str) -> str | None:
     empty by design — see ``PdfMarkdown.extractor`` docstring) so the
     caller can fall back to the chunk-concatenated raw text path.
     """
-    with get_search_db() as session:
+    with get_search_db_read() as session:
         row = session.execute(
             sql_text("SELECT markdown FROM pdf_markdown WHERE file_id = :fid"),
             {"fid": file_id},
@@ -590,36 +590,40 @@ async def _save_summary(
     durable.
     """
     now = datetime.now(UTC).isoformat()
-    with get_search_db() as session:
-        session.execute(
-            sql_text(
-                "INSERT INTO file_summaries "
-                "(file_id, short_summary, long_summary, model, context_type, "
-                "context_chars, was_truncated, status, created_at) "
-                "VALUES (:file_id, :short_summary, :long_summary, :model, "
-                ":context_type, :context_chars, :was_truncated, 'generated', "
-                ":created_at) "
-                "ON CONFLICT(file_id) DO UPDATE SET "
-                "short_summary = excluded.short_summary, "
-                "long_summary = excluded.long_summary, "
-                "model = excluded.model, "
-                "context_type = excluded.context_type, "
-                "context_chars = excluded.context_chars, "
-                "was_truncated = excluded.was_truncated, "
-                "status = excluded.status, "
-                "created_at = excluded.created_at"
-            ),
-            {
-                "file_id": file_id,
-                "short_summary": short_summary,
-                "long_summary": long_summary,
-                "model": model,
-                "context_type": context_type,
-                "context_chars": context_chars,
-                "was_truncated": 1 if was_truncated else 0,
-                "created_at": now,
-            },
-        )
+
+    def _write() -> None:
+        with get_search_db() as session:
+            session.execute(
+                sql_text(
+                    "INSERT INTO file_summaries "
+                    "(file_id, short_summary, long_summary, model, context_type, "
+                    "context_chars, was_truncated, status, created_at) "
+                    "VALUES (:file_id, :short_summary, :long_summary, :model, "
+                    ":context_type, :context_chars, :was_truncated, 'generated', "
+                    ":created_at) "
+                    "ON CONFLICT(file_id) DO UPDATE SET "
+                    "short_summary = excluded.short_summary, "
+                    "long_summary = excluded.long_summary, "
+                    "model = excluded.model, "
+                    "context_type = excluded.context_type, "
+                    "context_chars = excluded.context_chars, "
+                    "was_truncated = excluded.was_truncated, "
+                    "status = excluded.status, "
+                    "created_at = excluded.created_at"
+                ),
+                {
+                    "file_id": file_id,
+                    "short_summary": short_summary,
+                    "long_summary": long_summary,
+                    "model": model,
+                    "context_type": context_type,
+                    "context_chars": context_chars,
+                    "was_truncated": 1 if was_truncated else 0,
+                    "created_at": now,
+                },
+            )
+
+    await asyncio.to_thread(_write)
 
     # Approach B: refresh the metadata embedding so the new summary
     # contributes to hierarchical RAG Stage 1 ranking. Failure here
@@ -814,7 +818,7 @@ def _get_detailed_summary(file_id: str) -> dict | None:
     Returns ``None`` when there is neither an active insight nor any
     workflow-state marker in ``file_summaries``.
     """
-    with get_search_db() as session:
+    with get_search_db_read() as session:
         active = session.execute(
             sql_text(
                 "SELECT content, metadata_json, created_at, created_by "
@@ -1050,7 +1054,7 @@ async def generate_detailed_summary(
     if settings.features.detailed_summaries == "false":
         return
 
-    indexed_file = _get_indexed_file(file_id)
+    indexed_file = await asyncio.to_thread(_get_indexed_file, file_id)
     if indexed_file is None:
         # Router would have returned 404 already; defence in depth.
         return
@@ -1059,16 +1063,20 @@ async def generate_detailed_summary(
         indexed_file["file_type"], indexed_file.get("mime_type")
     )
     if context_type not in _SUPPORTED_CONTEXT_TYPES:
-        _set_detailed_status(
+        await asyncio.to_thread(
+            _set_detailed_status,
             file_id,
             DETAILED_STATUS_FAILED,
             error=f"Unsupported file type: {indexed_file['file_type']}",
         )
         return
 
-    raw_context = _build_context(indexed_file, context_type)
+    raw_context = await asyncio.to_thread(
+        _build_context, indexed_file, context_type
+    )
     if not raw_context:
-        _set_detailed_status(
+        await asyncio.to_thread(
+            _set_detailed_status,
             file_id,
             DETAILED_STATUS_FAILED,
             error="No usable content to summarize",
@@ -1086,7 +1094,8 @@ async def generate_detailed_summary(
     )
 
     model = resolved.profile.config.model
-    _set_detailed_status(
+    await asyncio.to_thread(
+        _set_detailed_status,
         file_id,
         DETAILED_STATUS_GENERATING,
         model=model,
@@ -1102,7 +1111,8 @@ async def generate_detailed_summary(
         logger.exception(
             "Detailed summary generation crashed for %s", file_id
         )
-        _set_detailed_status(
+        await asyncio.to_thread(
+            _set_detailed_status,
             file_id,
             DETAILED_STATUS_FAILED,
             error=f"LLM error: {e}",
@@ -1110,7 +1120,8 @@ async def generate_detailed_summary(
         return
 
     if not raw or not raw.strip():
-        _set_detailed_status(
+        await asyncio.to_thread(
+            _set_detailed_status,
             file_id,
             DETAILED_STATUS_FAILED,
             error="LLM returned empty output",
@@ -1118,7 +1129,8 @@ async def generate_detailed_summary(
         return
 
     saved_text = raw.strip()
-    _save_detailed_summary(
+    await asyncio.to_thread(
+        _save_detailed_summary,
         file_id=file_id,
         detailed_summary=saved_text,
         model=model,
@@ -1204,7 +1216,7 @@ async def generate_summary(file_id: str, resolved: Resolved) -> None:
     """
     active_summary_generations[file_id] = active_summary_generations.get(file_id, 0) + 1
     try:
-        indexed_file = _get_indexed_file(file_id)
+        indexed_file = await asyncio.to_thread(_get_indexed_file, file_id)
         if indexed_file is None:
             return
         context_type = _classify_file_type(
@@ -1212,7 +1224,9 @@ async def generate_summary(file_id: str, resolved: Resolved) -> None:
         )
         if context_type not in _SUPPORTED_CONTEXT_TYPES:
             return
-        raw_context = _build_context(indexed_file, context_type)
+        raw_context = await asyncio.to_thread(
+            _build_context, indexed_file, context_type
+        )
         if not raw_context:
             return
         await _generate_short_long(
@@ -1295,37 +1309,41 @@ class SummariesWorker:
         if not want_short and not want_detailed:
             return 0
 
-        pending: list[tuple[str, str, str]] = []  # (file_id, drive, feature)
-        with get_search_db() as session:
-            if want_short:
-                rows = session.execute(
-                    sql_text(
-                        "SELECT f.file_id, f.drive FROM indexed_files f "
-                        "WHERE f.active = 1 AND f.metadata_indexed = 1 "
-                        "AND f.file_type IN ('video', 'audio', 'document', 'text') "
-                        "AND f.file_id NOT IN (SELECT file_id FROM file_summaries "
-                        f"WHERE {_HAS_SHORT_SUMMARY})"
+        def _collect() -> list[tuple[str, str, str]]:
+            pending: list[tuple[str, str, str]] = []  # (file_id, drive, feature)
+            with get_search_db() as session:
+                if want_short:
+                    rows = session.execute(
+                        sql_text(
+                            "SELECT f.file_id, f.drive FROM indexed_files f "
+                            "WHERE f.active = 1 AND f.metadata_indexed = 1 "
+                            "AND f.file_type IN ('video', 'audio', 'document', 'text') "
+                            "AND f.file_id NOT IN (SELECT file_id FROM file_summaries "
+                            f"WHERE {_HAS_SHORT_SUMMARY})"
+                        )
+                    ).fetchall()
+                    pending.extend(
+                        (file_id, drive, "summaries") for file_id, drive in rows
                     )
-                ).fetchall()
-                pending.extend(
-                    (file_id, drive, "summaries") for file_id, drive in rows
-                )
-            if want_detailed:
-                rows = session.execute(
-                    sql_text(
-                        "SELECT f.file_id, f.drive FROM indexed_files f "
-                        "WHERE f.active = 1 AND f.metadata_indexed = 1 "
-                        "AND f.file_type IN ('video', 'audio', 'document', 'text') "
-                        "AND f.file_id NOT IN ("
-                        "  SELECT file_id FROM file_summaries "
-                        "  WHERE detailed_status IS NOT NULL"
-                        ")"
+                if want_detailed:
+                    rows = session.execute(
+                        sql_text(
+                            "SELECT f.file_id, f.drive FROM indexed_files f "
+                            "WHERE f.active = 1 AND f.metadata_indexed = 1 "
+                            "AND f.file_type IN ('video', 'audio', 'document', 'text') "
+                            "AND f.file_id NOT IN ("
+                            "  SELECT file_id FROM file_summaries "
+                            "  WHERE detailed_status IS NOT NULL"
+                            ")"
+                        )
+                    ).fetchall()
+                    pending.extend(
+                        (file_id, drive, "detailed_summaries")
+                        for file_id, drive in rows
                     )
-                ).fetchall()
-                pending.extend(
-                    (file_id, drive, "detailed_summaries")
-                    for file_id, drive in rows
-                )
+            return pending
+
+        pending = await asyncio.to_thread(_collect)
 
         # De-dupe file_ids: a file may appear in both gaps. Keep the
         # first occurrence (short/long if both modes are on, detailed
@@ -1386,16 +1404,16 @@ class SummariesWorker:
         """
         want_short = (
             settings.features.summaries != "false"
-            and not _has_summary(file_id)
+            and not await asyncio.to_thread(_has_summary, file_id)
         )
         want_detailed = (
             settings.features.detailed_summaries == "on_index"
-            and not _has_detailed_summary(file_id)
+            and not await asyncio.to_thread(_has_detailed_summary, file_id)
         )
         if not want_short and not want_detailed:
             return
 
-        indexed_file = _get_indexed_file(file_id)
+        indexed_file = await asyncio.to_thread(_get_indexed_file, file_id)
         if indexed_file is None:
             return
 
@@ -1405,7 +1423,9 @@ class SummariesWorker:
         if context_type not in _SUPPORTED_CONTEXT_TYPES:
             return
 
-        raw_context = _build_context(indexed_file, context_type)
+        raw_context = await asyncio.to_thread(
+            _build_context, indexed_file, context_type
+        )
         if not raw_context:
             logger.debug(
                 "Summaries: no context available for %s (%s)",

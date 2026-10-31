@@ -279,7 +279,7 @@ def search(
         _f_clip = (
             _pool.submit(
                 _vector_search_clip, clip_vector, candidates,
-                mode=mode, include_scene_clip=include_scene_clip,
+                mode=mode, include_scene_clip=include_scene_clip, drive=drive,
             )
             if clip_vector is not None and not skip_clip
             else None
@@ -562,12 +562,60 @@ def _vector_search_text(
         return results
 
 
+#: sqlite-vec refuses a KNN ``k`` above 4096.
+_CLIP_DRIVE_FETCH_MAX = 4096
+_CLIP_DRIVE_FETCH_FACTORS = (4, 16, 64)
+
+
+def _drive_thumbnail_neighbours(
+    engine,
+    knn_sql: str,
+    vec_bytes: bytes,
+    limit: int,
+    drive: str,
+) -> list[tuple[str, float]]:
+    """The ``limit`` nearest thumbnail rows of ``drive``'s active files.
+
+    The thumbnail partition spans every drive, so the fetch widens until
+    ``limit`` rows of the drive survive or the partition is exhausted.
+    """
+    sizes = sorted(
+        {min(limit * f, _CLIP_DRIVE_FETCH_MAX) for f in _CLIP_DRIVE_FETCH_FACTORS}
+        | {_CLIP_DRIVE_FETCH_MAX}
+    )
+    kept: list[tuple[str, float]] = []
+    for asked in sizes:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                sql_text(knn_sql), {"vec": vec_bytes, "limit": asked}
+            ).fetchall()
+        if not rows:
+            return []
+        with get_search_db_read() as session:
+            visible = {
+                emb_id
+                for (emb_id,) in session.query(Embedding.id)
+                .join(IndexedFile, IndexedFile.file_id == Embedding.file_id)
+                .filter(
+                    Embedding.id.in_([row[0] for row in rows]),
+                    IndexedFile.drive == drive,
+                    IndexedFile.active.is_(True),
+                )
+                .all()
+            }
+        kept = [(row[0], row[1]) for row in rows if row[0] in visible][:limit]
+        if len(kept) >= limit or len(rows) < asked:
+            break
+    return kept
+
+
 def _vector_search_clip(
     query_vector: np.ndarray,
     limit: int,
     *,
     mode: SearchMode = "precision",
     include_scene_clip: bool = False,
+    drive: str | None = None,
 ) -> list[_VectorMatch]:
     """Search the CLIP vector table for similar embeddings.
 
@@ -591,8 +639,11 @@ def _vector_search_clip(
             2026-05-02-thumbnail-clip-default-shallow-search.md).
             When ``True``, scene-frame ``embedding_type="clip"`` rows
             are added — the "scene with X" / shipped-from-the-toggle
-            route. Both types share ``vec_clip`` (same dim/model) so
-            this is a post-MATCH filter on ``embeddings.embedding_type``.
+            route. The default KNN reads only the ``clip_thumbnail``
+            partition, so scene rows cannot take its candidate slots.
+        drive: The requested drive. With Scene search off, the
+            candidates are this drive's active files only, so the
+            score gates judge them and not other drives' thumbnails.
 
     Returns:
         List of vector matches.
@@ -600,17 +651,34 @@ def _vector_search_clip(
     engine = get_search_engine()
     vec_bytes = query_vector.tobytes()
 
-    with engine.connect() as conn:
-        rows = conn.execute(
-            sql_text(
-                "SELECT embedding_id, distance "
-                "FROM vec_clip "
-                "WHERE vector MATCH :vec "
-                "ORDER BY distance "
-                "LIMIT :limit"
-            ),
-            {"vec": vec_bytes, "limit": limit},
-        ).fetchall()
+    # Scene search keeps the unconstrained KNN: constraining it to both
+    # partitions scans nearly the whole table anyway, and the candidate
+    # pool would change from the global nearest rows.
+    if include_scene_clip:
+        knn_sql = (
+            "SELECT embedding_id, distance "
+            "FROM vec_clip "
+            "WHERE vector MATCH :vec "
+            "ORDER BY distance "
+            "LIMIT :limit"
+        )
+    else:
+        knn_sql = (
+            "SELECT embedding_id, distance "
+            "FROM vec_clip "
+            "WHERE vector MATCH :vec AND k = :limit "
+            "AND embedding_type = 'clip_thumbnail' "
+            "ORDER BY distance"
+        )
+
+    if drive and not include_scene_clip:
+        rows = _drive_thumbnail_neighbours(engine, knn_sql, vec_bytes, limit, drive)
+    else:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                sql_text(knn_sql),
+                {"vec": vec_bytes, "limit": limit},
+            ).fetchall()
 
     if not rows:
         return []
@@ -1925,6 +1993,33 @@ def _select_embedding_types(
     return type_map.get(file_type, ("metadata", None))
 
 
+def _visible_neighbours(
+    session,
+    embedding_ids: list[str],
+    embedding_type: str,
+    source_file_id: str,
+    drive: str | None,
+) -> list[tuple[str, str]]:
+    """``(embedding_id, file_id)`` of the neighbours that may be shown.
+
+    Rows of another type, of the source, of inactive files and of other
+    drives are dropped.
+    """
+    query = (
+        session.query(Embedding.id, Embedding.file_id)
+        .join(IndexedFile, IndexedFile.file_id == Embedding.file_id)
+        .filter(
+            Embedding.id.in_(embedding_ids),
+            Embedding.embedding_type == embedding_type,
+            Embedding.file_id != source_file_id,
+            IndexedFile.active.is_(True),
+        )
+    )
+    if drive:
+        query = query.filter(IndexedFile.drive == drive)
+    return query.all()
+
+
 def _find_similar_by_embedding(
     file_id: str,
     embedding_type: str,
@@ -2019,14 +2114,9 @@ def _find_similar_by_embedding(
     # Must fetch enough to look past the source file's own embeddings
     # (e.g. a video with 89 CLIP frames will occupy the top ~89 slots).
     #
-    # Both vector tables are shared between embedding types — vec_text
-    # holds whisper, text_content, metadata and tfidf_keywords; vec_clip
-    # holds scene frames beside representative ones — and MATCH is a
-    # global KNN that knows nothing about the type. Measured on a real
-    # index, a tfidf_keywords query came back 85% whisper, and a
-    # clip_thumbnail query 38% scene frames, each scored as though it
-    # were the requested channel. So the type filter is applied here,
-    # and the fetch is widened until enough rows survive it.
+    # The partition constraint keeps the scan inside the requested type,
+    # but drive, activity and the source itself are still filtered after
+    # the KNN, so the fetch is widened until enough files survive them.
     source_count = len(embedding_ids)
     base_limit = source_count + limit + 20
     distances: dict[str, float] = {}
@@ -2038,11 +2128,11 @@ def _find_similar_by_embedding(
                 sql_text(
                     f"SELECT embedding_id, distance "
                     f"FROM {vec_table} "
-                    f"WHERE vector MATCH :vec "
-                    f"ORDER BY distance "
-                    f"LIMIT :limit"
+                    f"WHERE vector MATCH :vec AND k = :k "
+                    f"AND embedding_type = :type "
+                    f"ORDER BY distance"
                 ),
-                {"vec": avg_vector.tobytes(), "limit": asked},
+                {"vec": avg_vector.tobytes(), "k": asked, "type": embedding_type},
             ).fetchall()
 
         if not rows:
@@ -2054,36 +2144,25 @@ def _find_similar_by_embedding(
             break
         with get_search_db_read() as session:
             usable = {
-                fid for (fid,) in session.query(Embedding.file_id)
-                .filter(
-                    Embedding.id.in_(list(distances)),
-                    Embedding.embedding_type == embedding_type,
+                fid for _, fid in _visible_neighbours(
+                    session, list(distances), embedding_type, file_id, drive,
                 )
-                .distinct()
-                .all()
             }
-        if len(usable - {file_id}) >= limit:
+        if len(usable) >= limit:
             break
 
-    # Look up file info for neighbor embeddings
+    # Only neighbours the viewer can be shown reach the quality filters, so
+    # another drive's files cannot move their gap, margin or spread.
     with get_search_db_read() as session:
-        neighbor_embeddings = (
-            session.query(Embedding)
-            .filter(
-                Embedding.id.in_(list(distances)),
-                Embedding.embedding_type == embedding_type,
-            )
-            .all()
+        neighbours = _visible_neighbours(
+            session, list(distances), embedding_type, file_id, drive,
         )
 
-        # Map embedding -> file_id with best score per file
         file_best_score: dict[str, float] = {}
-        for emb in neighbor_embeddings:
-            if emb.file_id == file_id:
-                continue  # exclude self
-            score = _l2_to_cosine_similarity(distances.get(emb.id, 2.0))
-            if score > file_best_score.get(emb.file_id, 0.0):
-                file_best_score[emb.file_id] = score
+        for emb_id, neighbour_file_id in neighbours:
+            score = _l2_to_cosine_similarity(distances.get(emb_id, 2.0))
+            if score > file_best_score.get(neighbour_file_id, 0.0):
+                file_best_score[neighbour_file_id] = score
 
         if not file_best_score:
             return []
@@ -2396,7 +2475,7 @@ def execute_search_compare(
 
     text_matches = _vector_search_text(text_vector, candidates)
     clip_matches = (
-        _vector_search_clip(clip_vector, candidates)
+        _vector_search_clip(clip_vector, candidates, drive=drive)
         if clip_vector is not None
         else []
     )
