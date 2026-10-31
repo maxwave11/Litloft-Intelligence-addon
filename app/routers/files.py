@@ -46,7 +46,7 @@ class CardMetadataRequest(BaseModel):
 
 @router.post("/files/card-metadata")
 async def get_card_metadata(body: CardMetadataRequest, drive: str = Depends(require_drive)) -> dict:
-    from app.database import get_search_db
+    from app.database import get_search_db_read
     from app.dependencies import get_summaries_worker
     from app.policy_client import is_feature_enabled
     from app.workers.summaries import active_summary_generations
@@ -72,8 +72,11 @@ async def get_card_metadata(body: CardMetadataRequest, drive: str = Depends(requ
         FROM indexed_files i LEFT JOIN file_summaries s ON s.file_id=i.file_id
         WHERE i.drive=:drive AND i.active=1 AND i.file_id IN :ids
     """).bindparams(bindparam("ids", expanding=True))
-    with get_search_db() as db:
-        rows = db.execute(statement, {"drive": drive, "ids": body.file_ids}).mappings().all()
+    def _read_rows() -> list:
+        with get_search_db_read() as db:
+            return db.execute(statement, {"drive": drive, "ids": body.file_ids}).mappings().all()
+
+    rows = await asyncio.to_thread(_read_rows)
     result = {}
     for row in rows:
         fid = row["file_id"]

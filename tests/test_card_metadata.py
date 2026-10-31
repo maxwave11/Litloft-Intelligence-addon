@@ -50,7 +50,7 @@ def test_scoped_metadata_includes_manual_summary_and_pending_transcript(tmp_path
     monkeypatch.setattr("app.routers.files.settings", SimpleNamespace(features=SimpleNamespace(
         summaries=short_mode, detailed_summaries=detailed_mode,
     )))
-    monkeypatch.setattr("app.database.get_search_db", database)
+    monkeypatch.setattr("app.database.get_search_db_read", database)
     monkeypatch.setattr("app.routers.files.get_index_manager", lambda: manager)
     monkeypatch.setattr("app.dependencies.get_summaries_worker", lambda: worker)
     monkeypatch.setattr("app.policy_client.is_feature_enabled", AsyncMock(return_value=True))

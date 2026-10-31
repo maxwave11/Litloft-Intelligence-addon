@@ -75,7 +75,8 @@ def engine(tmp_path, monkeypatch):
             session.close()
 
     monkeypatch.setattr("app.routers.user_summary.get_search_db", _get_search_db)
-    monkeypatch.setattr("app.routers.summaries.get_search_db", _get_search_db)
+    monkeypatch.setattr("app.routers.user_summary.get_search_db_read", _get_search_db)
+    monkeypatch.setattr("app.routers.summaries.get_search_db_read", _get_search_db)
     return engine
 
 
