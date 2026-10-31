@@ -29,6 +29,7 @@ vi.mock("@/addons/intelligence/api", async () => {
     fetchLLMChoices: vi.fn(async () => {
       throw new Error("not stubbed");
     }),
+    getIntelligenceStatus: vi.fn(async () => null),
     isProfileUnavailable: actual.isProfileUnavailable,
     LLMRequestError: actual.LLMRequestError,
   };
